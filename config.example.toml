@@ -1,0 +1,69 @@
+# Screenshot Translator v0.1.1
+# 实际配置：~/.config/screenshot-translator/config.toml
+# 修改后会自动重新加载；下一次截图使用新配置。
+
+[app]
+# X11 全局快捷键。
+hotkey = "ctrl+alt+d"
+# 在贴图图像区域按住左键超过这个时间后，拖动即可移动整个贴图。
+drag_hold_ms = 350
+# 点击贴图和控制按钮以外的位置时关闭贴图。
+close_on_outside_click = true
+
+[capture]
+# v0.1.1：Qt/X11 直接抓取桌面，再由本程序框选，以便精确得到 x/y/w/h。
+# 预留为后续可插拔截图后端。
+backend = "qt_x11"
+# 最小有效框选尺寸。
+min_width = 8
+min_height = 8
+
+[ocr]
+# Umi-OCR 官方 HTTP API，默认端口 1224。
+api_url = "http://127.0.0.1:1224/api/ocr"
+# Umi-OCR 未运行时自动尝试启动并隐藏。
+auto_start = true
+umi_ocr = "~/tools/Umi-OCR_Linux_Paddle_2.1.5/umi-ocr.sh"
+startup_timeout_s = 8.0
+request_timeout_s = 20.0
+# 中文模型同时能识别常见英文，适合默认自动识别源语言。
+language = "models/config_chinese.txt"
+parser = "multi_para"
+limit_side_len = 2880
+
+[translation]
+# v0.1.1 支持：google / libretranslate / identity
+# identity 只回显原文，专门用于排查截图、OCR、贴图链路。
+backend = "google"
+# 默认自动识别源语言，统一翻译到简体中文。
+# 若只想英译中，可改 source = "en"。
+source = "auto"
+target = "zh-CN"
+timeout_s = 12.0
+
+[translation.google]
+# 免 Key 的非官方接口，可能被 Google 429 限流。
+endpoint = "https://translate.googleapis.com/translate_a/single"
+
+[translation.libretranslate]
+# 可填自建或兼容 LibreTranslate 的实例。
+endpoint = "http://127.0.0.1:5000/translate"
+api_key = ""
+
+[overlay]
+# 译文遮罩透明度 0~255。
+mask_alpha = 220
+corner_radius = 4
+padding = 3
+font_min_px = 9
+font_max_px = 28
+# 胶囊按钮与截图的间距。
+toolbar_gap = 6
+# auto / below / above / inside
+# auto：优先框外下方，其次上方，再不行放框内右下角。
+toolbar_position = "auto"
+
+[log]
+level = "INFO"
+max_bytes = 2097152
+backup_count = 3
