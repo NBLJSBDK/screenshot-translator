@@ -277,7 +277,6 @@ class Selector(QWidget):
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
         )
         self.setGeometry(self.virtual)
         self.setCursor(Qt.CursorShape.CrossCursor)
@@ -285,7 +284,13 @@ class Selector(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def show_selector(self) -> None:
-        self.show()
+        # A normal top-level window can be constrained to the work area by
+        # KWin, leaving the panel visible underneath the captured desktop.
+        # Full-screen state makes the selection surface cover the whole X11
+        # screen, including panels, so displayed pixels and mouse coordinates
+        # share the same origin.
+        self.setGeometry(self.virtual)
+        self.showFullScreen()
         self.raise_()
         self.activateWindow()
         self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
@@ -297,12 +302,17 @@ class Selector(QWidget):
 
     def paintEvent(self, _event) -> None:
         p = QPainter(self)
-        p.drawImage(self.rect(), self.desktop)
+        p.fillRect(self.rect(), Qt.GlobalColor.black)
+        window_origin = self.mapToGlobal(QPoint(0, 0))
+        image_origin = window_origin - self.virtual.topLeft()
+        p.drawImage(-image_origin, self.desktop)
         p.fillRect(self.rect(), QColor(0, 0, 0, 95))
 
         rect = self.selection_rect()
         if not rect.isNull() and rect.width() > 0 and rect.height() > 0:
-            p.drawImage(rect, self.desktop, rect)
+            global_rect = QRect(window_origin + rect.topLeft(), rect.size())
+            source_rect = global_rect.translated(-self.virtual.topLeft())
+            p.drawImage(rect.topLeft(), self.desktop, source_rect)
             p.setPen(QPen(QColor(240, 240, 240), 2))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRect(rect.adjusted(0, 0, -1, -1))
@@ -348,13 +358,17 @@ class Selector(QWidget):
             self.update()
             return
 
-        crop = self.desktop.copy(rect)
-        global_rect = QRect(
-            rect.x() + self.virtual.x(),
-            rect.y() + self.virtual.y(),
-            rect.width(),
-            rect.height(),
-        )
+        window_origin = self.mapToGlobal(QPoint(0, 0))
+        global_rect = QRect(window_origin + rect.topLeft(), rect.size())
+        source_rect = global_rect.translated(-self.virtual.topLeft())
+        source_rect = source_rect.intersected(self.desktop.rect())
+        if source_rect.width() < min_w or source_rect.height() < min_h:
+            self.start = None
+            self.end = None
+            self.update()
+            return
+        crop = self.desktop.copy(source_rect)
+        global_rect = source_rect.translated(self.virtual.topLeft())
         self.hide()
         self.selected.emit(global_rect, crop)
         self.close()
