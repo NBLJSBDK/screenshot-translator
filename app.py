@@ -78,6 +78,7 @@ XDG_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/sta
 XDG_CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
 CONFIG_DIR = XDG_CONFIG_HOME / APP_SLUG
 CONFIG_PATH = CONFIG_DIR / "config.toml"
+KEYS_PATH = CONFIG_DIR / "keys.toml"
 STATE_DIR = XDG_STATE_HOME / APP_SLUG
 CACHE_DIR = XDG_CACHE_HOME / APP_SLUG
 LOG_PATH = STATE_DIR / "app.log"
@@ -111,6 +112,9 @@ DEFAULTS: dict[str, Any] = {
         "timeout_s": 12.0,
         "google": {
             "endpoint": "https://translate.googleapis.com/translate_a/single",
+        },
+        "google_cloud": {
+            "endpoint": "https://translation.googleapis.com/language/translate/v2",
         },
         "libretranslate": {
             "endpoint": "http://127.0.0.1:5000/translate",
@@ -166,6 +170,24 @@ def load_config() -> dict[str, Any]:
     with CONFIG_PATH.open("rb") as f:
         user_cfg = tomllib.load(f)
     return deep_merge(DEFAULTS, user_cfg)
+
+
+def load_keys() -> dict[str, Any]:
+    """Load optional credentials without ever logging their contents."""
+    if not KEYS_PATH.exists():
+        return {}
+    try:
+        with KEYS_PATH.open("rb") as f:
+            keys = tomllib.load(f)
+    except Exception as exc:
+        raise RuntimeError(f"密钥配置读取失败: {KEYS_PATH}") from exc
+    if not isinstance(keys, dict):
+        raise RuntimeError(f"密钥配置格式异常: {KEYS_PATH}")
+
+    mode = KEYS_PATH.stat().st_mode & 0o777
+    if mode & 0o077:
+        LOG.warning("keys file permissions are %03o; recommend 600 path=%s", mode, KEYS_PATH)
+    return keys
 
 
 def configure_logging(cfg: dict[str, Any]) -> logging.Logger:
@@ -445,10 +467,11 @@ class PipelineWorker(QThread):
     done = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, png: bytes, cfg: dict[str, Any]) -> None:
+    def __init__(self, png: bytes, cfg: dict[str, Any], keys: dict[str, Any] | None = None) -> None:
         super().__init__()
         self.png = png
         self.cfg = cfg
+        self.keys = keys or {}
 
     def run(self) -> None:
         try:
@@ -462,18 +485,17 @@ class PipelineWorker(QThread):
                 raise RuntimeError("没有识别到文字")
 
             paragraphs = self._make_paragraphs(blocks)
-            translated: list[dict[str, Any]] = []
-            for para in paragraphs:
-                text = str(para["text"]).strip()
-                if not text:
-                    continue
-                translated.append(
-                    {
-                        "source": text,
-                        "translated": self._translate(text),
-                        "bbox": para["bbox"],
-                    }
-                )
+            paragraphs = [para for para in paragraphs if str(para["text"]).strip()]
+            texts = [str(para["text"]).strip() for para in paragraphs]
+            translated_texts = self._translate_many(texts)
+            translated = [
+                {
+                    "source": text,
+                    "translated": translated_text,
+                    "bbox": para["bbox"],
+                }
+                for para, text, translated_text in zip(paragraphs, texts, translated_texts)
+            ]
 
             if not translated:
                 raise RuntimeError("OCR 有结果，但没有可翻译文本")
@@ -647,9 +669,19 @@ class PipelineWorker(QThread):
             return text
         if backend == "google":
             return self._translate_google(text)
+        if backend in {"google_cloud", "google-cloud", "cloud_google"}:
+            return self._translate_google_cloud([text])[0]
         if backend in {"libre", "libretranslate"}:
             return self._translate_libre(text)
         raise RuntimeError(f"未知翻译后端: {backend}")
+
+    def _translate_many(self, texts: list[str]) -> list[str]:
+        if not texts:
+            return []
+        backend = str(self.cfg["translation"]["backend"]).strip().lower()
+        if backend in {"google_cloud", "google-cloud", "cloud_google"}:
+            return self._translate_google_cloud(texts)
+        return [self._translate(text) for text in texts]
 
     def _translate_google(self, text: str) -> str:
         cfg = self.cfg["translation"]
@@ -680,6 +712,59 @@ class PipelineWorker(QThread):
             raise RuntimeError("Google 翻译返回格式异常") from exc
         if not translated:
             raise RuntimeError("Google 翻译返回空结果")
+        return translated
+
+    def _translate_google_cloud(self, texts: list[str]) -> list[str]:
+        cfg = self.cfg["translation"]
+        cloud_cfg = cfg.get("google_cloud", {})
+        cloud_keys = self.keys.get("google_cloud", {})
+        if not isinstance(cloud_keys, dict):
+            raise RuntimeError(f"Google Cloud 密钥配置格式异常: {KEYS_PATH}")
+        api_key = str(cloud_keys.get("api_key", "")).strip()
+        if not api_key:
+            raise RuntimeError(f"未配置 Google Cloud API Key: {KEYS_PATH}")
+        if len(texts) > 128:
+            translated: list[str] = []
+            for offset in range(0, len(texts), 128):
+                translated.extend(self._translate_google_cloud(texts[offset : offset + 128]))
+            return translated
+
+        target = str(cfg["target"]).strip()
+        if not target or target.lower() == "auto":
+            raise RuntimeError("Google Cloud 翻译需要有效的 target 语言")
+        payload: dict[str, Any] = {
+            "q": texts,
+            "target": target,
+            "format": "text",
+        }
+        source = str(cfg["source"]).strip()
+        if source and source.lower() != "auto":
+            payload["source"] = source
+
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        endpoint = str(
+            cloud_cfg.get(
+                "endpoint",
+                DEFAULTS["translation"]["google_cloud"]["endpoint"],
+            )
+        )
+        res = self._http_json(
+            endpoint,
+            method="POST",
+            body=body,
+            headers={
+                "Content-Type": "application/json; charset=UTF-8",
+                "X-Goog-Api-Key": api_key,
+            },
+            timeout=float(cfg["timeout_s"]),
+        )
+        try:
+            items = res["data"]["translations"]
+            translated = [str(item["translatedText"]) for item in items]
+        except Exception as exc:
+            raise RuntimeError("Google Cloud 翻译返回格式异常") from exc
+        if len(translated) != len(texts) or any(not item for item in translated):
+            raise RuntimeError("Google Cloud 翻译返回数量异常")
         return translated
 
     def _translate_libre(self, text: str) -> str:
@@ -1110,8 +1195,22 @@ class Controller(QObject):
             notify("截图编码失败", str(exc))
             return
 
+        backend = str(self.cfg["translation"]["backend"]).strip().lower()
+        keys: dict[str, Any] = {}
+        if backend in {"google_cloud", "google-cloud", "cloud_google"}:
+            try:
+                keys = load_keys()
+            except Exception as exc:
+                self.close_loading()
+                self.busy = False
+                self.pending_rect = None
+                self.pending_image = None
+                LOG.exception("keys load failed")
+                notify("密钥配置失败", str(exc))
+                return
+
         LOG.info("capture width=%d height=%d x=%d y=%d", rect.width(), rect.height(), rect.x(), rect.y())
-        self.worker = PipelineWorker(png, self.cfg)
+        self.worker = PipelineWorker(png, self.cfg, keys)
         self.worker.done.connect(self.pipeline_done)
         self.worker.failed.connect(self.pipeline_failed)
         self.worker.finished.connect(self.worker.deleteLater)
@@ -1190,6 +1289,7 @@ def run_check(app: QApplication, cfg: dict[str, Any]) -> int:
     critical = 0
     print(f"{APP_NAME} {VERSION}")
     print(f"配置: {CONFIG_PATH}")
+    print(f"密钥: {KEYS_PATH}")
     print(f"日志: {LOG_PATH}")
     print()
 
@@ -1263,6 +1363,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="KDE/X11 screenshot translation overlay")
     parser.add_argument("--check", action="store_true", help="检查本地运行环境，不调用外部翻译服务")
     parser.add_argument("--config-path", action="store_true", help="只打印配置文件路径")
+    parser.add_argument("--keys-path", action="store_true", help="只打印密钥配置文件路径")
     parser.add_argument("--log-path", action="store_true", help="只打印日志文件路径")
     parser.add_argument("--version", action="store_true", help="打印版本")
     return parser.parse_args(argv)
@@ -1275,6 +1376,9 @@ def main() -> int:
         return 0
     if args.config_path:
         print(CONFIG_PATH)
+        return 0
+    if args.keys_path:
+        print(KEYS_PATH)
         return 0
     if args.log_path:
         print(LOG_PATH)

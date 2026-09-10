@@ -1,0 +1,5 @@
+# 复制到 ~/.config/screenshot-translator/keys.toml 后填写。
+# 真实 Key 只保存在用户配置目录，不要提交到 Git 或粘贴到聊天中。
+
+[google_cloud]
+api_key = ""

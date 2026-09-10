@@ -2,6 +2,8 @@
 
 面向 **KDE Plasma + Linux + X11** 的无主窗口截图翻译贴片器。
 
+新机器从克隆到第一次运行的完整流程见：[使用说明.md](使用说明.md)。
+
 默认体验：
 
 `Ctrl+Alt+D` → 框选区域 → Umi-OCR → 自动识别源语言 → 翻译为 `zh-CN` → 在原截图位置显示翻译贴图。
@@ -50,6 +52,12 @@ V0.1.2 以第二个原型为主干，并合入：
 
 ```text
 ~/.config/screenshot-translator/config.toml
+```
+
+密钥配置（可选）：
+
+```text
+~/.config/screenshot-translator/keys.toml
 ```
 
 日志：
@@ -127,6 +135,31 @@ source = "en"
 
 如果 Google 被 429，可切换其他 backend。V0.1.2 已预留 `libretranslate`；`identity` 不翻译，只把原文画回去，方便独立验证 UI/OCR。
 
+### Google Cloud API Key
+
+正式 Google Cloud Translation Basic v2 后端使用独立的密钥文件，不把 Key 写入主配置或仓库：
+
+```bash
+cp keys.example.toml ~/.config/screenshot-translator/keys.toml
+chmod 600 ~/.config/screenshot-translator/keys.toml
+```
+
+编辑 `keys.toml`：
+
+```toml
+[google_cloud]
+api_key = "你的 Google Cloud API Key"
+```
+
+再把主配置切换为：
+
+```toml
+[translation]
+backend = "google_cloud"
+```
+
+程序每次截图时读取密钥文件；Key 缺失或配置格式错误会以通知和日志提示，不会把 Key 写入日志。
+
 ## Umi-OCR
 
 默认：
@@ -149,4 +182,5 @@ http://127.0.0.1:1224/api/ocr
 - 截图后端当前固定为 `qt_x11`；配置字段已预留给后续后端。
 - 混合 DPI / 不同分数缩放的多屏尚未专门适配。
 - 原文字擦除仍是半透明遮罩，不做 inpainting。
-- Google backend 是免 Key 的非官方接口，仍可能出现 HTTP 429。
+- `google` backend 是免 Key 的非官方接口，仍可能出现 HTTP 429。
+- `google_cloud` backend 使用官方 Basic v2 API，支持一次请求多个段落；需要用户自行配置 API Key。

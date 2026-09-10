@@ -17,7 +17,7 @@ Ctrl+Alt+D → 全屏选择层拖选 → Umi-OCR → 翻译 → 在原屏幕位�
 ## 已验证环境
 
 ```text
-主机：Linux desktop (example environment)
+主机：Linux 桌面（示例环境）
 系统：Debian GNU/Linux 13 (trixie)
 Python：3.13.5
 桌面：KDE Plasma / X11
@@ -42,10 +42,12 @@ HTTP API：`http://127.0.0.1:1224/api/ocr`。
 ```text
 app.py                 主程序：选择器、OCR/翻译、贴图、输入监听
 config.example.toml    默认配置模板
+keys.example.toml      Google Cloud API Key 配置模板，不含真实密钥
 requirements.txt       Python 依赖
 install.sh             创建 .venv 并安装依赖
 run.sh                 使用 .venv 启动 app.py
 README.md              用户说明
+使用说明.md            新机器安装、Google Cloud 配置和配额防护
 AGENTS.md              本文件，唯一的 Agent 说明
 ```
 
@@ -53,6 +55,7 @@ AGENTS.md              本文件，唯一的 Agent 说明
 
 ```text
 配置：~/.config/screenshot-translator/config.toml
+密钥：~/.config/screenshot-translator/keys.toml（可选，权限应为 600）
 日志：~/.local/state/screenshot-translator/app.log
 缓存：~/.cache/screenshot-translator/
 ```
@@ -96,9 +99,12 @@ AGENTS.md              本文件，唯一的 Agent 说明
 
 ```text
 google（免 Key 非官方接口，可能 HTTP 429）
+google_cloud（官方 Cloud Translation Basic v2，Key 从独立 keys.toml 读取）
 libre / libretranslate
 identity（原样返回 OCR 文本，仅用于本地链路测试）
 ```
+
+`google_cloud` 使用 `https://translation.googleapis.com/language/translate/v2`，通过 `X-Goog-Api-Key` 请求头认证；一次请求最多提交 128 个段落，避免逐段等待。Key 不得写入主配置、日志或 Git。
 
 Google 曾出现 HTTP 429。不要让网络翻译成功与否掩盖截图、OCR 或 UI 问题。
 
@@ -173,6 +179,7 @@ target = "zh-CN"
 - 不删除 `~/tools/Umi-OCR_Linux_Paddle_2.1.5`。
 - 不重新安装 Manggo 或覆盖 `/usr/bin/qt.conf`、`/usr/plugins` 等系统 Qt 路径。
 - 不假设系统有 Tesseract；它不是项目依赖。
+- 不把真实 API Key、`keys.toml` 或其他凭据提交到仓库。
 - 不增加主窗口、托盘图标、设置 GUI 或模态错误窗口，除非用户明确改变需求。
 - 不把 `.venv`、缓存、日志或个人配置提交到仓库。
 - 不使用 `git reset --hard`、`git clean -fd` 等会销毁未知修改的命令。

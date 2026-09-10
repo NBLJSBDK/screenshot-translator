@@ -32,7 +32,8 @@ parser = "multi_para"
 limit_side_len = 2880
 
 [translation]
-# v0.1.1 支持：google / libretranslate / identity
+# 支持：google（免 Key 网页接口）/ google_cloud（官方 Basic v2）/
+# libretranslate / identity
 # identity 只回显原文，专门用于排查截图、OCR、贴图链路。
 backend = "google"
 # 默认自动识别源语言，统一翻译到简体中文。
@@ -44,6 +45,10 @@ timeout_s = 12.0
 [translation.google]
 # 免 Key 的非官方接口，可能被 Google 429 限流。
 endpoint = "https://translate.googleapis.com/translate_a/single"
+
+[translation.google_cloud]
+# Google Cloud Translation Basic v2 官方接口；Key 放在 ~/.config/screenshot-translator/keys.toml。
+endpoint = "https://translation.googleapis.com/language/translate/v2"
 
 [translation.libretranslate]
 # 可填自建或兼容 LibreTranslate 的实例。
