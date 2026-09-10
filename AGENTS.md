@@ -106,6 +106,8 @@ Google 曾出现 HTTP 429。不要让网络翻译成功与否掩盖截图、OCR 
 
 `render_translation()` 复制原图，在 OCR 段落边界框上绘制深色半透明圆角遮罩，再绘制译文。当前版本不做 AI 背景修复或 inpainting，图片和非文字区域保留原图。
 
+截图框选完成后，`LoadingWindow` 在选区中心显示一个不抢焦点的转圈指示；OCR/翻译完成或失败后必须关闭，不得遮挡或改变最终贴图交互。
+
 `OverlayWindow` / `DraggableImage` 显示原位贴图和紧凑控件：
 
 ```text

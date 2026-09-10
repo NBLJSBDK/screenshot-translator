@@ -381,6 +381,66 @@ class Selector(QWidget):
         super().keyPressEvent(event)
 
 
+class LoadingWindow(QWidget):
+    """Small non-interactive spinner shown while OCR/translation is running."""
+
+    def __init__(self, image_global: QRect) -> None:
+        super().__init__()
+        self.angle = 0
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(80)
+
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setFixedSize(34, 34)
+        self._place(image_global)
+
+    def _place(self, image_global: QRect) -> None:
+        center = image_global.center()
+        screen = QGuiApplication.screenAt(center) or QGuiApplication.primaryScreen()
+        if screen is None:
+            self.move(center - QPoint(self.width() // 2, self.height() // 2))
+            return
+        bounds = screen.geometry()
+        x = min(max(bounds.left(), center.x() - self.width() // 2), bounds.right() - self.width() + 1)
+        y = min(max(bounds.top(), center.y() - self.height() // 2), bounds.bottom() - self.height() + 1)
+        self.move(x, y)
+
+    def _tick(self) -> None:
+        self.angle = (self.angle + 30) % 360
+        self.update()
+
+    def show_loading(self) -> None:
+        self.show()
+        self.raise_()
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        margin = 1
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(20, 20, 20, 205))
+        p.drawEllipse(self.rect().adjusted(margin, margin, -margin, -margin))
+
+        pen = QPen(QColor(248, 248, 248, 245), 3)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawArc(self.rect().adjusted(9, 9, -9, -9), self.angle * 16, 270 * 16)
+        p.end()
+
+    def closeEvent(self, event) -> None:
+        self.timer.stop()
+        super().closeEvent(event)
+
+
 class PipelineWorker(QThread):
     done = Signal(object)
     failed = Signal(str)
@@ -979,6 +1039,7 @@ class Controller(QObject):
         self.input.hotkey_pressed.connect(self.trigger)
         self.input.mouse_pressed.connect(self.global_mouse_press)
         self.selector: Selector | None = None
+        self.loading: LoadingWindow | None = None
         self.overlay: OverlayWindow | None = None
         self.worker: PipelineWorker | None = None
         self.pending_rect: QRect | None = None
@@ -990,6 +1051,7 @@ class Controller(QObject):
         self.watcher.fileChanged.connect(self.config_changed)
 
         app.aboutToQuit.connect(self.input.stop)
+        app.aboutToQuit.connect(self.close_loading)
         LOG.info("started version=%s hotkey=%s", VERSION, self.cfg["app"]["hotkey"])
 
     def config_changed(self, _path: str) -> None:
@@ -1036,8 +1098,11 @@ class Controller(QObject):
         self.pending_rect = QRect(rect)
         self.pending_image = image.copy()
         try:
+            self.loading = LoadingWindow(self.pending_rect)
+            self.loading.show_loading()
             png = image_to_png_bytes(image)
         except Exception as exc:
+            self.close_loading()
             self.busy = False
             self.pending_rect = None
             self.pending_image = None
@@ -1076,12 +1141,14 @@ class Controller(QObject):
             LOG.exception("overlay failed")
             notify("贴图失败", str(exc))
         finally:
+            self.close_loading()
             self.busy = False
             self.pending_image = None
             self.pending_rect = None
             self.worker = None
 
     def pipeline_failed(self, message: str) -> None:
+        self.close_loading()
         self.busy = False
         self.pending_image = None
         self.pending_rect = None
@@ -1090,6 +1157,11 @@ class Controller(QObject):
 
     def overlay_closed(self) -> None:
         self.overlay = None
+
+    def close_loading(self) -> None:
+        if self.loading is not None:
+            self.loading.close()
+            self.loading = None
 
     def global_mouse_press(self, x: int, y: int) -> None:
         if not bool(self.cfg["app"].get("close_on_outside_click", True)):
