@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Screenshot Translator v0.2.0
+"""Screenshot Translator v0.2.1
 
 KDE Plasma / Linux screenshot translation overlay (X11 and Wayland).
 
@@ -65,27 +65,39 @@ from PySide6.QtCore import (
     Qt,
     QThread,
     QTimer,
+    QUrl,
     Signal,
     Slot,
 )
 from PySide6.QtGui import (
     QColor,
+    QDesktopServices,
     QFont,
     QFontMetricsF,
     QGuiApplication,
+    QIcon,
     QImage,
     QKeyEvent,
     QMouseEvent,
     QPainter,
+    QPalette,
     QPen,
     QPixmap,
     QRegion,
 )
-from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QPushButton, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QHBoxLayout,
+    QLabel,
+    QMenu,
+    QPushButton,
+    QSystemTrayIcon,
+    QWidget,
+)
 
 APP_NAME = "Screenshot Translator"
 APP_SLUG = "screenshot-translator"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 BASE_DIR = Path(__file__).resolve().parent
 
 SESSION_TYPE = os.environ.get("XDG_SESSION_TYPE", "").lower()
@@ -122,6 +134,7 @@ DEFAULTS: dict[str, Any] = {
     "app": {
         "hotkey": "ctrl+alt+d",
         "input_backend": "auto",
+        "tray_icon": True,
         "drag_hold_ms": 0,
         "close_on_outside_click": True,
     },
@@ -315,6 +328,79 @@ def quit_running_instance() -> int:
         return 1
     print(f"已请求退出实例 PID {pid}。")
     return 0
+
+
+def _trim_transparent(image: QImage) -> QImage:
+    left, top, right, bottom = image.width(), image.height(), -1, -1
+    for y in range(image.height()):
+        for x in range(image.width()):
+            if image.pixelColor(x, y).alpha() > 8:
+                left = min(left, x)
+                right = max(right, x)
+                top = min(top, y)
+                bottom = max(bottom, y)
+    if right < left or bottom < top:
+        return image
+    cropped = image.copy(left, top, right - left + 1, bottom - top + 1)
+    # QIcon returns file-based SVG pixmaps tagged with the screen DPR; scaling
+    # such an image would halve logical sizes, so normalize before reuse.
+    cropped.setDevicePixelRatio(1.0)
+    return cropped
+
+
+def make_tray_icon() -> QIcon:
+    """Monochrome tray icon tinted to the current color scheme.
+
+    Colorful application icons look out of place on the KDE panel, so the
+    theme glyph is recolored to the palette's text color (white on dark).
+    Source glyphs carry their own padding (Font Awesome viewBox), so the
+    transparent margin is trimmed before scaling into each icon size.
+    """
+    color = QColor(252, 252, 252)
+    if isinstance(QGuiApplication.instance(), QApplication):
+        color = QGuiApplication.instance().palette().color(QPalette.ColorRole.WindowText)
+    sources = [QIcon(str(BASE_DIR / "assets" / "app-icon.svg"))]
+    sources.extend(QIcon.fromTheme(name) for name in ("translate", "languages-symbolic", "accessories-screenshot-tool"))
+    for source in sources:
+        if source.isNull():
+            continue
+        image = _trim_transparent(source.pixmap(128, 128).toImage())
+        if image.isNull():
+            continue
+        tinted = QImage(image.size(), QImage.Format.Format_ARGB32)
+        tinted.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(tinted)
+        painter.drawImage(0, 0, image)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+        painter.fillRect(tinted.rect(), color)
+        painter.end()
+
+        icon = QIcon()
+        # Plasma renders the first SNI pixmap at its natural/logical size and
+        # does not upscale; multiple sizes make it pick the small 16px entry.
+        # Provide a single large pixmap instead and let the tray scale it down.
+        canvas = QImage(64, 64, QImage.Format.Format_ARGB32)
+        canvas.fill(Qt.GlobalColor.transparent)
+        scaled = tinted.scaled(
+            60,
+            60,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        painter = QPainter(canvas)
+        painter.drawImage((64 - scaled.width()) // 2, (64 - scaled.height()) // 2, scaled)
+        painter.end()
+        icon.addPixmap(QPixmap.fromImage(canvas))
+        return icon
+    pixmap = QPixmap(64, 64)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(color)
+    painter.drawEllipse(8, 8, 48, 48)
+    painter.end()
+    return QIcon(pixmap)
 
 
 def image_to_png_bytes(image: QImage) -> bytes:
@@ -1781,20 +1867,75 @@ class Controller(QObject):
         self.pending_rect: QRect | None = None
         self.pending_image: QImage | None = None
         self.busy = False
+        self.tray: QSystemTrayIcon | None = None
+        self.tray_menu: QMenu | None = None
 
         self.watcher = QFileSystemWatcher(self)
         self.watcher.addPath(str(CONFIG_PATH))
         self.watcher.fileChanged.connect(self.config_changed)
 
+        self._setup_tray()
+
         app.aboutToQuit.connect(self.input.stop)
         app.aboutToQuit.connect(self.close_loading)
         LOG.info("started version=%s hotkey=%s", VERSION, self.cfg["app"]["hotkey"])
+
+    def _setup_tray(self) -> None:
+        if not bool(self.cfg["app"].get("tray_icon", True)):
+            return
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            LOG.warning("系统托盘不可用；跳过托盘图标注册")
+            return
+        icon = make_tray_icon()
+        self.app.setWindowIcon(icon)
+        self.tray = QSystemTrayIcon(icon, self.app)
+        self.tray.setToolTip(f"{APP_NAME} {VERSION} · {self.cfg['app']['hotkey']}")
+        self.tray_menu = QMenu()
+        capture_action = self.tray_menu.addAction("截图并翻译")
+        capture_action.triggered.connect(self.trigger)
+        config_action = self.tray_menu.addAction("打开配置文件")
+        config_action.triggered.connect(
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(CONFIG_PATH)))
+        )
+        log_action = self.tray_menu.addAction("打开日志")
+        log_action.triggered.connect(
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(LOG_PATH)))
+        )
+        self.tray_menu.addSeparator()
+        quit_action = self.tray_menu.addAction("退出")
+        quit_action.triggered.connect(self.app.quit)
+        self.tray.setContextMenu(self.tray_menu)
+        self.tray.activated.connect(self._tray_activated)
+        self.tray.show()
+        LOG.info("tray icon registered theme_icon=%s", not icon.isNull())
+
+    def _teardown_tray(self) -> None:
+        if self.tray is None:
+            return
+        self.tray.hide()
+        self.tray.deleteLater()
+        self.tray = None
+        self.tray_menu = None
+
+    def _apply_tray_config(self) -> None:
+        wanted = bool(self.cfg["app"].get("tray_icon", True))
+        if wanted and self.tray is None:
+            self._setup_tray()
+        elif not wanted and self.tray is not None:
+            self._teardown_tray()
+        elif self.tray is not None:
+            self.tray.setToolTip(f"{APP_NAME} {VERSION} · {self.cfg['app']['hotkey']}")
+
+    def _tray_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.trigger()
 
     def config_changed(self, _path: str) -> None:
         try:
             new_cfg = load_config()
             self.input.restart_hotkey(str(new_cfg["app"]["hotkey"]))
             self.cfg = new_cfg
+            self._apply_tray_config()
             reload_log_level(self.cfg)
             LOG.info("config reloaded")
         except Exception:

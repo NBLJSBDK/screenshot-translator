@@ -1,4 +1,4 @@
-# Screenshot Translator v0.2.0
+# Screenshot Translator v0.2.1
 # 实际配置：~/.config/screenshot-translator/config.toml
 # 修改后会自动重新加载；下一次截图使用新配置。
 
@@ -10,6 +10,8 @@ hotkey = "ctrl+alt+d"
 # auto / pynput / kglobalaccel
 # auto：X11 用 pynput，Wayland 用 KGlobalAccel。
 input_backend = "auto"
+# 在系统托盘显示图标（KDE StatusNotifierItem）。菜单可截图、打开配置/日志、退出。
+tray_icon = true
 # 在贴图图像区域按住左键即可拖动；0 表示立即拖动，大于 0 表示需长按相应毫秒。
 drag_hold_ms = 0
 # 点击贴图和控制按钮以外的位置时关闭贴图。
