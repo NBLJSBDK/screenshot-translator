@@ -1,4 +1,4 @@
-# Screenshot Translator v0.3.1
+# Screenshot Translator v0.3.2
 
 面向 **KDE Plasma + Linux** 的无主窗口截图翻译贴片器，支持 X11 与 KDE Plasma Wayland 会话。
 
@@ -6,13 +6,12 @@
 
 默认体验：
 
-`Ctrl+Alt+D` → 框选区域 → Umi-OCR → 自动识别源语言 → 翻译为 `zh-CN` → 在原截图位置显示翻译贴图。
+`F14` → 框选区域 → Umi-OCR → 自动识别源语言 → 翻译为 `zh-CN` → 在原截图位置显示翻译贴图。
 
 ## 交互
 
-- 默认快捷键：`Ctrl+Alt+D`（截图翻译）。
-- 第二个快捷键：`Super+Ctrl+Shift+O`（`app.copy_hotkey`，可改可留空禁用）——只调用 Umi-OCR 识别，不翻译，识别出的原文自动复制到剪贴板并弹通知。
-- 快捷键支持组合键和无修饰键的 `F13`–`F24`（例如 `hotkey = "f13"`）；KDE Wayland 下以配置文件为准（启动/改配置时写入 KGlobalAccel）。
+- 默认快捷键：`F14`（截图翻译）；`F15`（`app.copy_hotkey`，可改可留空禁用）——只调用 Umi-OCR 识别，不翻译，识别出的原文自动复制到剪贴板并弹通知。
+- 快捷键支持组合键和无修饰键的 `F13`–`F24`；KDE Wayland 下以配置文件为准（启动/改配置时写入 KGlobalAccel）。使用 F13–F24 前需要先启用系统键位选项，见下文“使用 F13–F24 作为快捷键”。
 - 框选完成后，选区中心显示转圈指示，OCR/翻译完成或失败后自动消失。
 - 贴图默认显示译图，原截图中的非文字区域保留。
 - OCR 文字区域使用半透明遮罩并绘制译文。
@@ -121,7 +120,7 @@ KDE Wayland 会话的检查应显示 `会话: OK (wayland KDE)`、`截图后端:
 ./run.sh
 ```
 
-然后按 `Ctrl+Alt+D`。
+然后按 `F14`（翻译）或 `F15`（只识别复制原文）。
 
 前台测试时用终端 `Ctrl+C` 退出常驻程序；从桌面快捷方式启动（没有终端窗口）时用下面的命令停止：
 
@@ -149,8 +148,8 @@ KDE Wayland 会话的检查应显示 `会话: OK (wayland KDE)`、`截图后端:
 
 ```toml
 [app]
-hotkey = "ctrl+alt+d"
-copy_hotkey = "super+ctrl+shift+o"  # 只识别并复制原文；留空禁用
+hotkey = "f14"                      # 截图翻译
+copy_hotkey = "f15"                 # 只识别并复制原文；留空禁用
 input_backend = "auto"             # auto / pynput / kglobalaccel
 
 [capture]

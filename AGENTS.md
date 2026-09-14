@@ -9,8 +9,8 @@ Screenshot Translator 是面向 Linux + KDE Plasma 的无主窗口截图翻译�
 默认流程：
 
 ```text
-Ctrl+Alt+D → 全屏选择层拖选 → Umi-OCR → 翻译 → 在原屏幕位置显示贴片
-Super+Ctrl+Shift+O（app.copy_hotkey，可留空禁用）→ 同样框选 → 只 OCR
+F14 → 全屏选择层拖选 → Umi-OCR → 翻译 → 在原屏幕位置显示贴片
+F15（app.copy_hotkey，可留空禁用）→ 同样框选 → 只 OCR
   → 原文自动复制到剪贴板 + 通知（不翻译、不显示贴图）
 ```
 
@@ -202,11 +202,11 @@ target = "zh-CN"
 1. `python -m py_compile app.py`、`bash -n install.sh run.sh`、`git diff --check`。
 2. `./run.sh --check`。
 3. 前台程序启动无异常，系统托盘出现图标；`./run.sh --quit` 能结束实例。
-4. `Ctrl+Alt+D` 显示覆盖整个屏幕的选择层（X11 下任务栏只出现一次；Wayland 下整屏变暗）。
+4. `F14` 显示覆盖整个屏幕的选择层（X11 下任务栏只出现一次；Wayland 下整屏变暗）。
 5. 拖选区域的显示像素、全局边界和 OCR 输入一致（Wayland 注意逻辑坐标×缩放 = 物理像素）。
 6. 使用 `identity` 验证原位贴图（Wayland 贴图应出现在选区原位置）。
 7. 验证原/译切换、复制原文、复制译文、`×`、右键关闭、中键归位、滚轮缩放、左键拖动、再次截图替换；Wayland 的 `Esc`/点击外部限制见上。
-8. 按 `Super+Ctrl+Shift+O`（`app.copy_hotkey`）框选：应只 OCR、不翻译，原文进入剪贴板并弹通知；`app.copy_hotkey` 留空时该动作不注册。
+8. 按 `F15`（`app.copy_hotkey`）框选：应只 OCR、不翻译，原文进入剪贴板并弹通知；`app.copy_hotkey` 留空时该动作不注册。
 9. 验证 OCR/翻译失败只通知和写日志。
 10. 最后单独测试 Google 或 LibreTranslate。
 
