@@ -32,11 +32,13 @@ X11 路径保留原有 `qt_x11` + `pynput` 实现。
 - `Selector`：统一按“全局逻辑坐标 → 物理像素”映射绘制和裁剪，Wayland 下全屏窗口固定主屏幕。
 - `app.input_backend = auto`：X11 用 `pynput`，Wayland 用 `KGlobalAccel`（`WaylandInputService`）。
 - `OverlayWindow`/`LoadingWindow` 在 Wayland 进入全屏透明画布模式，`setMask()` 限制输入区域，其余点击穿透。
+- 贴图交互：左键按住立即拖动、滚轮以鼠标位置为锚点缩放（25%~400%）、中键归位（位置+100%）、右键点击图片关闭；合成事件单测已通过。
 - `--check` 按会话输出 `截图后端` 和 `全局快捷键` 检查结果。
 
 ### 重要实现事实
 
-- Wayland 下 `QScreen.devicePixelRatio()` 会被 Qt 取整（1.5 报成 2.0），坐标换算必须使用 `截图物理尺寸 / 逻辑屏幕尺寸`。
+- Wayland 下 `QScreen.devicePixelRatio()` 会被 Qt 取整（1.5 报成 2.0），坐标换算必须使用 `截图物理尺寸 / 逻辑屏幕尺寸`；窗口实际按 1.5 渲染（`QWidget.devicePixelRatioF()`=1.5）。
+- Spectacle 后台抓屏必须加 `-i`：已有 Spectacle GUI 实例时会吞掉请求并 exit 0 但不写文件。
 - PySide6 `QDBusMessage` 无法序列化 KGlobalAccel `setShortcut` 的 `u` flags（会发成 `i`），设置快捷键必须走 `gdbus`（优先）或 `dbus-send` 子进程；`doRegister`、`setInactive`、`shortcut` 读取和信号订阅可用 QtDBus。
 - QtDBus 信号订阅的 slot 必须写成 `"1on_pressed(QString,QString,qlonglong)"` 这种 SLOT 宏格式字符串。
 - KGlobalAccel 仅 `doRegister` 不会抓取按键；必须调用 `setShortcut` 且 flags = `SetPresent(2) | NoAutoloading(4)` = 6。
@@ -53,7 +55,7 @@ X11 路径保留原有 `qt_x11` + `pynput` 实现。
 
 ## 4. Not Verified / Limitations
 
-- [UNVERIFIED] 真实鼠标交互：拖选、右键取消、过长/过短选区、贴图按钮、长按拖动、再次截图替换尚未人工验收。
+- [UNVERIFIED] 真实鼠标交互：拖选、右键取消、过长/过短选区、贴图按钮、拖动、滚轮缩放、中键归位、右键关闭、再次截图替换尚未人工验收。
 - [UNVERIFIED] 真实翻译后端（`google` / `google_cloud`）的最新一次验证；集成测试使用 `identity`。
 - [UNVERIFIED] 多屏、负坐标、混合 DPI；Wayland 选择层当前固定在 Qt 主屏幕。
 - [LIMITATION] Wayland 全局快捷键触发选择层时 KWin 不给键盘焦点（日志 `active=False`），`Esc` 可能无效；右键仍可取消。

@@ -88,7 +88,7 @@ AGENTS.md              本文件，唯一的 Agent 说明
 `capture_desktop()` 按 `effective_capture_backend()` 选择后端：
 
 - `qt_x11`（默认 X11）：`capture_virtual_desktop()` 使用 `QScreen.grabWindow(0)` 抓取各屏幕并合成虚拟桌面。
-- `spectacle`（KDE Wayland）：`capture_desktop_spectacle()` 运行 `spectacle -b -n -f -o <临时文件>` 抓取整屏，读入 `QImage` 后立即删除临时文件。Wayland 客户端不能读取其他 surface，必须先抓取再显示选择层。
+- `spectacle`（KDE Wayland）：`capture_desktop_spectacle()` 运行 `spectacle -b -n -i -f -o <临时文件>` 抓取整屏，读入 `QImage` 后立即删除临时文件。Wayland 客户端不能读取其他 surface，必须先抓取再显示选择层。`-i` 不能省略：桌面已有 Spectacle GUI 实例时，普通后台调用会被吞掉并返回 0 但不生成文件。
 
 `CaptureResult` 统一返回逻辑虚拟桌面矩形、物理像素截图和 `scale_x`/`scale_y`（物理像素/逻辑像素）。Wayland 下 `QScreen.devicePixelRatio()` 会被 Qt 取整（1.5 报成 2.0），不得用它做坐标换算，必须用截图尺寸与逻辑屏幕尺寸的比值。
 
@@ -144,12 +144,15 @@ Google 曾出现 HTTP 429。不要让网络翻译成功与否掩盖截图、OCR 
 - `译`：复制完整译文。
 - `×`：关闭贴图。
 - 控件优先放截图下方，空间不足时放上方，再不行放右下角内部。
-- 左键长按默认约 350ms 后可以拖动整个贴图和控件组。
+- 左键按住图片即可拖动整个贴图和控件组（`app.drag_hold_ms = 0` 立即拖动；大于 0 时需长按）。
+- 滚轮以鼠标位置为锚点缩放贴图，范围 25%~400%，工具栏按钮尺寸不变。
+- 中键点击图片：归位，位置回到最初框选处并将缩放恢复为 100%。
+- 右键点击图片：关闭贴图。
 - 使用无边框、置顶和 `Tool` 窗口标志；不要使用 `Qt.Popup`。
 
 X11 下 `OverlayWindow` 通过全局矩形定位贴图。Wayland 不允许客户端定位顶层窗口，因此 `OverlayWindow` 进入 `canvas_mode`：窗口是全屏透明画布，贴图按逻辑坐标画在画布内，`setMask()` 把输入区域限制为贴图和按钮，其余位置的点击穿透给下层窗口；拖动只移动画布内的子控件，不移动窗口。`LoadingWindow` 同样用全屏透明画布绘制选区中心的转圈，并用 mask 把自己限制在转圈区域。
 
-贴图在 X11 下只允许通过 `Esc`、点击贴图和控件组外部、点击 `×` 关闭；Wayland 没有全局鼠标监听，只能通过 `×`、再次截图或 `Esc`（若窗口有键盘焦点）关闭。单纯失去焦点或 Alt+Tab 不得关闭。再次截图时先关闭旧贴图，一次只保留一个。
+贴图在 X11 下可以通过 `Esc`、点击贴图和控件组外部、右键点击图片或 `×` 关闭；Wayland 没有全局鼠标监听，只能通过右键点击图片、`×`、再次截图或 `Esc`（若窗口有键盘焦点）关闭。单纯失去焦点或 Alt+Tab 不得关闭。再次截图时先关闭旧贴图，一次只保留一个。
 
 ### 全局输入和控制器
 
@@ -170,6 +173,8 @@ cd ~/tools/screenshot-translator
 ./run.sh --check
 ./run.sh
 ```
+
+程序是单实例的：`acquire_single_instance()` 用 `~/.local/state/screenshot-translator/app.lock` 的 `flock` 阻止重复启动；没有终端窗口的实例用 `./run.sh --quit` 停止（读取锁文件 PID 后发送 SIGTERM）。锁文件不能以 `"w"` 模式打开，否则会清掉正在运行实例的 PID。
 
 `install.sh` 只在项目中创建 `.venv` 并安装 `requirements.txt`，不应使用 `sudo`，不应污染系统 Qt 路径。`--check` 不访问外部翻译服务；Umi-OCR 未运行但脚本存在时可以报告运行时自动启动警告。
 
@@ -196,7 +201,7 @@ target = "zh-CN"
 4. `Ctrl+Alt+D` 显示覆盖整个屏幕的选择层（X11 下任务栏只出现一次；Wayland 下整屏变暗）。
 5. 拖选区域的显示像素、全局边界和 OCR 输入一致（Wayland 注意逻辑坐标×缩放 = 物理像素）。
 6. 使用 `identity` 验证原位贴图（Wayland 贴图应出现在选区原位置）。
-7. 验证原/译切换、复制原文、复制译文、`×`、`Esc`、点击外部、Alt+Tab、长按拖动和再次截图替换；Wayland 的 `Esc`/点击外部限制见上。
+7. 验证原/译切换、复制原文、复制译文、`×`、右键关闭、中键归位、滚轮缩放、左键拖动、再次截图替换；Wayland 的 `Esc`/点击外部限制见上。
 8. 验证 OCR/翻译失败只通知和写日志。
 9. 最后单独测试 Google 或 LibreTranslate。
 

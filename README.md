@@ -1,4 +1,4 @@
-# Screenshot Translator v0.1.2
+# Screenshot Translator v0.2.0
 
 面向 **KDE Plasma + Linux** 的无主窗口截图翻译贴片器，支持 X11 与 KDE Plasma Wayland 会话。
 
@@ -8,7 +8,7 @@
 
 `Ctrl+Alt+D` → 框选区域 → Umi-OCR → 自动识别源语言 → 翻译为 `zh-CN` → 在原截图位置显示翻译贴图。
 
-## V0.1.2 交互
+## V0.2.0 交互
 
 - 默认快捷键：`Ctrl+Alt+D`。
 - 框选完成后，选区中心显示转圈指示，OCR/翻译完成或失败后自动消失。
@@ -22,7 +22,10 @@
 - `Esc`：关闭贴图（贴图拥有键盘焦点时）。
 - 点击贴图和控制组以外的位置：关闭（仅 X11）。
 - `Alt+Tab` / 单纯失去焦点：不会主动关闭。
-- 在贴图图像区域按住左键约 350ms 后拖动：移动整个贴图和控制组。
+- 在贴图图像区域按住左键即可拖动整个贴图和控制组（`drag_hold_ms = 0` 为立即拖动）。
+- 在贴图上滚动滚轮：以鼠标位置为中心缩放贴图（25%~400%）。
+- 中键点击贴图：归位，回到最初框选位置并恢复 100% 大小。
+- 右键点击贴图：关闭贴图。
 - 再次触发截图时会关闭旧贴图；一次只保留一个。
 - OCR/翻译/贴图失败：系统通知 + 日志，不弹错误对话框。
 
@@ -37,7 +40,7 @@ Wayland 不允许应用读取其他窗口内容或进行全局输入监听，因
 
 ## 合并内容
 
-V0.1.2 以第二个原型为主干，并合入：
+当前版本以第二个原型为主干，并合入：
 
 - XDG 配置目录。
 - `./run.sh --check` 环境检查。
@@ -118,7 +121,13 @@ KDE Wayland 会话的检查应显示 `会话: OK (wayland KDE)`、`截图后端:
 
 然后按 `Ctrl+Alt+D`。
 
-前台测试时用终端 `Ctrl+C` 退出常驻程序。
+前台测试时用终端 `Ctrl+C` 退出常驻程序；从桌面快捷方式启动（没有终端窗口）时用下面的命令停止：
+
+```bash
+./run.sh --quit
+```
+
+程序是单实例的：已经运行时再次启动只会提示“已在运行”。
 
 ## 配置
 
@@ -152,7 +161,7 @@ target = "zh-CN"
 source = "en"
 ```
 
-如果 Google 被 429，可切换其他 backend。V0.1.2 已预留 `libretranslate`；`identity` 不翻译，只把原文画回去，方便独立验证 UI/OCR。
+如果 Google 被 429，可切换其他 backend。已预留 `libretranslate`；`identity` 不翻译，只把原文画回去，方便独立验证 UI/OCR。
 
 ### Google Cloud API Key
 
@@ -195,7 +204,7 @@ http://127.0.0.1:1224/api/ocr
 ~/tools/Umi-OCR_Linux_Paddle_2.1.5/umi-ocr.sh
 ```
 
-## V0.1.2 限制
+## 当前限制
 
 - X11 与 KDE Plasma Wayland 核心流程已验证；GNOME、wlroots 等其他 Wayland compositor 未验证。
 - Wayland 下无法实现全局鼠标监听：点击贴图外关闭不可用，用 `×` 或再次触发快捷键代替。
