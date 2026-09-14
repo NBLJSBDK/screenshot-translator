@@ -34,6 +34,7 @@ X11 路径保留原有 `qt_x11` + `pynput` 实现。
 - `OverlayWindow`/`LoadingWindow` 在 Wayland 进入全屏透明画布模式，`setMask()` 限制输入区域，其余点击穿透。
 - 贴图交互：左键按住立即拖动、滚轮以鼠标位置为锚点缩放（25%~400%）、中键归位（位置+100%）、右键点击图片关闭；合成事件单测已通过。
 - 第二个全局快捷键（默认 `Super+Ctrl+Shift+O`，`app.copy_hotkey`）：只调用 Umi-OCR 并把原文复制到剪贴板（`ocr.copy_parser` 可单独指定解析方案）；KGlobalAccel 双动作注册与 `translate=False` 流水线已单测。
+- 快捷键支持无修饰键的 F13-F24；KDE Wayland 以配置为准（启动/配置变更都写入 KGlobalAccel）。KDE 默认把 FK13-F18 映射为 XF86Tools/XF86Launch5-9，需要按 README 的 `fkeys:basic_13-24`（localectl + kxkbrc + 注销重登）启用真正的 F13-F24。
 - 单实例保护（`app.lock` + flock）和 `--quit` 停止常驻实例；系统托盘（StatusNotifierItem）提供截图、截图并复制原文、打开配置/日志、退出；已实测 SNI 注册成功。
 - `--check` 按会话输出 `截图后端` 和 `全局快捷键` 检查结果。
 

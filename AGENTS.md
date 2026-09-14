@@ -165,7 +165,7 @@ X11 下 `OverlayWindow` 通过全局矩形定位贴图。Wayland 不允许客户
 - `pynput`（X11）：`InputService` 监听两个全局快捷键和鼠标按下事件，`close_on_outside_click` 依赖它。
 - `kglobalaccel`（KDE Wayland）：`WaylandInputService` 通过 KGlobalAccel D-Bus 注册两个动作并订阅 `globalShortcutPressed`，按 `shortcut` 名分派到 `hotkey_pressed` / `copy_hotkey_pressed`。PySide6 无法序列化 `setShortcut` 的 `u` flags，因此设置快捷键通过 `gdbus`（优先）或 `dbus-send` 子进程完成；doRegister、setInactive 和信号订阅仍走 QtDBus。Wayland 没有全局鼠标监听，`mouse_pressed` 不会触发。
 
-快捷键 `ctrl+alt+d` / `super+ctrl+shift+o` 必须可配置。Wayland 下 KGlobalAccel 中已有的绑定优先保留（用户可在 System Settings 修改），配置文件中的快捷键在首次注册或配置变更时应用；留空表示把该动作标记为 inactive。
+快捷键支持组合键和无修饰键的 F13-F24（例如 `f13`）。配置文件为准：每次启动和配置变更都会写入 KGlobalAccel；在 System Settings 中的临时修改会在下次启动时被配置覆盖。留空表示把该动作标记为 inactive。X11/pynput 只支持到 F20。
 
 `Controller` 负责配置热加载、快捷键重注册、选择层、后台流水线、贴图生命周期、系统托盘图标（`app.tray_icon` 热切换）和点击外部关闭逻辑。托盘用 `QSystemTrayIcon`（KDE 下为 StatusNotifierItem），菜单为截图、截图并复制原文、打开配置、打开日志、退出；左键单击等同触发截图。`_start_selection(mode)` 以 `pending_mode`（`translate` / `copy`）区分两条流水线；`copy` 模式完成后写入剪贴板并通知，不创建 `OverlayWindow`。
 
