@@ -1,6 +1,6 @@
 # Screenshot Translator v0.1.2
 
-面向 **KDE Plasma + Linux + X11** 的无主窗口截图翻译贴片器。
+面向 **KDE Plasma + Linux** 的无主窗口截图翻译贴片器，支持 X11 与 KDE Plasma Wayland 会话。
 
 新机器从克隆到第一次运行的完整流程见：[使用说明.md](使用说明.md)。
 
@@ -20,11 +20,20 @@
   - `译`：复制完整译文。
   - `×`：关闭。
 - `Esc`：关闭贴图（贴图拥有键盘焦点时）。
-- 点击贴图和控制组以外的位置：关闭。
+- 点击贴图和控制组以外的位置：关闭（仅 X11）。
 - `Alt+Tab` / 单纯失去焦点：不会主动关闭。
 - 在贴图图像区域按住左键约 350ms 后拖动：移动整个贴图和控制组。
 - 再次触发截图时会关闭旧贴图；一次只保留一个。
 - OCR/翻译/贴图失败：系统通知 + 日志，不弹错误对话框。
+
+### KDE Wayland 会话的差异
+
+Wayland 不允许应用读取其他窗口内容或进行全局输入监听，因此使用以下替换方案：
+
+- 截图：先调用 Spectacle 全屏抓取，再显示本程序的全屏选择层；选择层中的像素与 OCR 输入一致。
+- 全局快捷键：注册到 KDE KGlobalAccel（可在“系统设置 → 快捷键”中调整）。
+- 贴图：使用全屏透明画布并按原位置绘制，画布只接管贴图和按钮区域，其他位置点击穿透。
+- 已知限制：点击贴图外不会关闭（用 `×` 或再次触发快捷键）；全局快捷键触发时选择层不获得键盘焦点，`Esc` 可能无效，可用鼠标右键取消；多屏与混合缩放尚未验证。
 
 ## 合并内容
 
@@ -95,7 +104,11 @@ sudo apt install python3-venv
 ./run.sh --check
 ```
 
-不会访问外部翻译服务，只检查 X11、Qt 屏幕、输入监听、Umi-OCR HTTP/启动脚本、系统通知等。
+不会访问外部翻译服务，只检查当前会话、截图后端、全局快捷键后端、Qt 屏幕、Umi-OCR HTTP/启动脚本、系统通知等。
+
+X11 会话的检查应显示 `会话: OK (x11 ...)`、`截图后端: OK (qt_x11)`、`全局快捷键(pynput): OK`。
+
+KDE Wayland 会话的检查应显示 `会话: OK (wayland KDE)`、`截图后端: OK (spectacle: ...)`、`全局快捷键(KGlobalAccel): OK`；缺少 `spectacle` 或 `gdbus`/`dbus-send` 时会报告 FAIL。
 
 ## 运行
 
@@ -120,12 +133,18 @@ sudo apt install python3-venv
 ```toml
 [app]
 hotkey = "ctrl+alt+d"
+input_backend = "auto"   # auto / pynput / kglobalaccel
+
+[capture]
+backend = "auto"         # auto / qt_x11 / spectacle
 
 [translation]
 backend = "google"
 source = "auto"
 target = "zh-CN"
 ```
+
+`auto` 会按当前会话自动选择：X11 使用 `qt_x11` + `pynput`，KDE Wayland 使用 `spectacle` + `kglobalaccel`。在 Wayland 下 `close_on_outside_click` 不生效。
 
 只英译中：
 
@@ -178,9 +197,10 @@ http://127.0.0.1:1224/api/ocr
 
 ## V0.1.2 限制
 
-- 只支持 X11；Wayland 暂不支持。
-- 截图后端当前固定为 `qt_x11`；配置字段已预留给后续后端。
-- 混合 DPI / 不同分数缩放的多屏尚未专门适配。
+- X11 与 KDE Plasma Wayland 核心流程已验证；GNOME、wlroots 等其他 Wayland compositor 未验证。
+- Wayland 下无法实现全局鼠标监听：点击贴图外关闭不可用，用 `×` 或再次触发快捷键代替。
+- Wayland 全局快捷键触发时选择层通常不获得键盘焦点，`Esc` 可能无效，可用鼠标右键取消。
+- 混合 DPI / 不同分数缩放的多屏尚未专门适配；Wayland 选择层当前固定显示在 Qt 主屏幕。
 - 原文字擦除仍是半透明遮罩，不做 inpainting。
 - `google` backend 是免 Key 的非官方接口，仍可能出现 HTTP 429。
 - `google_cloud` backend 使用官方 Basic v2 API，支持一次请求多个段落；需要用户自行配置 API Key。

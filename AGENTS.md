@@ -4,7 +4,7 @@
 
 ## 项目目标
 
-Screenshot Translator 是面向 Linux + KDE Plasma + X11 的无主窗口截图翻译贴片工具。它不提供普通主窗口、托盘设置界面或完整截图管理器。
+Screenshot Translator 是面向 Linux + KDE Plasma 的无主窗口截图翻译贴片工具，支持 X11 和 KDE Plasma Wayland 会话。它不提供普通主窗口、托盘设置界面或完整截图管理器。
 
 默认流程：
 
@@ -12,12 +12,25 @@ Screenshot Translator 是面向 Linux + KDE Plasma + X11 的无主窗口截图�
 Ctrl+Alt+D → 全屏选择层拖选 → Umi-OCR → 翻译 → 在原屏幕位置显示贴片
 ```
 
-当前 v0.1.x 只支持 X11，程序明确拒绝 Wayland。不要宣称 Wayland 支持。
+X11 使用 Qt 直接抓屏和 pynput 全局输入；KDE Wayland 使用 Spectacle 全屏抓取、KGlobalAccel 全局快捷键和全屏透明画布贴图。核心流程已在两边验证；Wayland 的点击外部关闭、键盘焦点、多屏和混合缩放有平台限制，不得夸大为已完成。
 
 ## 已验证环境
 
+Wayland 目标环境：
+
 ```text
-主机：Linux 桌面（示例环境）
+系统：Arch Linux（rolling，内核 7.2.4）
+桌面：KDE Plasma / Wayland
+会话：XDG_SESSION_TYPE=wayland，WAYLAND_DISPLAY=wayland-0
+Python：3.14.7
+Spectacle：6.7.5
+屏幕：eDP-1 2560x1440 物理，缩放 1.5，逻辑 1707x960，devicePixelRatio 报告为 2.0
+全局快捷键：KGlobalAccel（kglobalacceld 6.7.5，KDE D-Bus）
+```
+
+X11 参考环境（历史验证）：
+
+```text
 系统：Debian GNU/Linux 13 (trixie)
 Python：3.13.5
 桌面：KDE Plasma / X11
@@ -35,7 +48,7 @@ Umi-OCR 安装位置：
 
 HTTP API：`http://127.0.0.1:1224/api/ocr`。
 
-项目依赖必须在项目 `.venv` 中安装。已验证 PySide6 6.11.2、pynput 1.8.2、evdev 2.0.0、python-xlib 0.33 和 six 可用；Debian 的 `python3.13-dev` 提供 evdev 编译所需的 `Python.h`。不要把这些依赖装进系统 Python。
+项目依赖必须在项目 `.venv` 中安装。已验证 PySide6 6.11.2（含 QtDBus）、pynput 1.8.2、evdev 2.0.0、python-xlib 0.33 和 six 可用；Python 3.14 上 evdev 需要可用的 C 工具链编译，Arch 安装 `base-devel` 即可。不要把这些依赖装进系统 Python。
 
 ## 文件与路径
 
@@ -72,17 +85,23 @@ AGENTS.md              本文件，唯一的 Agent 说明
 
 ### 截图和全屏选择层
 
-`capture_virtual_desktop()` 使用 Qt/X11 的 `QScreen.grabWindow(0)` 抓取各屏幕并合成虚拟桌面，返回全局虚拟桌面矩形和 `QImage`。
+`capture_desktop()` 按 `effective_capture_backend()` 选择后端：
+
+- `qt_x11`（默认 X11）：`capture_virtual_desktop()` 使用 `QScreen.grabWindow(0)` 抓取各屏幕并合成虚拟桌面。
+- `spectacle`（KDE Wayland）：`capture_desktop_spectacle()` 运行 `spectacle -b -n -f -o <临时文件>` 抓取整屏，读入 `QImage` 后立即删除临时文件。Wayland 客户端不能读取其他 surface，必须先抓取再显示选择层。
+
+`CaptureResult` 统一返回逻辑虚拟桌面矩形、物理像素截图和 `scale_x`/`scale_y`（物理像素/逻辑像素）。Wayland 下 `QScreen.devicePixelRatio()` 会被 Qt 取整（1.5 报成 2.0），不得用它做坐标换算，必须用截图尺寸与逻辑屏幕尺寸的比值。
 
 `Selector` 是无边框全屏选择层：
 
 - 必须覆盖整个屏幕，包括 KDE 面板和任务栏；选择时任务栏不应重复出现。
 - 当前实现使用 `WindowFullScreen`，不要退回只覆盖 available geometry 的普通窗口。
-- 背景绘制、选区预览和裁剪都要通过窗口全局原点映射到虚拟桌面坐标。
+- 背景绘制、选区预览和裁剪都通过“全局逻辑坐标 → 物理像素”映射完成，显示的像素必须和送给 OCR 的截图一致。
 - 左键拖动选择；`Esc` 或右键取消；小于最小尺寸的区域无效。
-- `selected` 同时返回全局 `QRect` 和裁剪后的 `QImage`。
+- `selected` 返回全局逻辑 `QRect` 和物理像素裁剪 `QImage`。
+- Wayland 下选择层固定显示在 Qt 主屏幕；KWin 可能不给它键盘焦点，此时 `Esc` 无效，右键仍可取消。
 
-不要把窗口局部坐标直接当作虚拟桌面坐标，也不要用拉伸整张图掩盖几何偏移。显示的像素必须和送给 OCR 的截图一致。
+不要把窗口局部坐标直接当作虚拟桌面坐标，也不要用拉伸整张图掩盖几何偏移。
 
 ### OCR 和翻译
 
@@ -128,11 +147,18 @@ Google 曾出现 HTTP 429。不要让网络翻译成功与否掩盖截图、OCR 
 - 左键长按默认约 350ms 后可以拖动整个贴图和控件组。
 - 使用无边框、置顶和 `Tool` 窗口标志；不要使用 `Qt.Popup`。
 
-贴图只允许通过 `Esc`、点击贴图和控件组外部、点击 `×` 关闭。单纯失去焦点或 Alt+Tab 不得关闭。再次截图时先关闭旧贴图，一次只保留一个。
+X11 下 `OverlayWindow` 通过全局矩形定位贴图。Wayland 不允许客户端定位顶层窗口，因此 `OverlayWindow` 进入 `canvas_mode`：窗口是全屏透明画布，贴图按逻辑坐标画在画布内，`setMask()` 把输入区域限制为贴图和按钮，其余位置的点击穿透给下层窗口；拖动只移动画布内的子控件，不移动窗口。`LoadingWindow` 同样用全屏透明画布绘制选区中心的转圈，并用 mask 把自己限制在转圈区域。
+
+贴图在 X11 下只允许通过 `Esc`、点击贴图和控件组外部、点击 `×` 关闭；Wayland 没有全局鼠标监听，只能通过 `×`、再次截图或 `Esc`（若窗口有键盘焦点）关闭。单纯失去焦点或 Alt+Tab 不得关闭。再次截图时先关闭旧贴图，一次只保留一个。
 
 ### 全局输入和控制器
 
-`InputService` 使用 `pynput` 监听全局快捷键和鼠标按下事件。默认快捷键 `ctrl+alt+d` 必须可配置。
+`create_input_service()` 按会话选择输入后端：
+
+- `pynput`（X11）：`InputService` 监听全局快捷键和鼠标按下事件，`close_on_outside_click` 依赖它。
+- `kglobalaccel`（KDE Wayland）：`WaylandInputService` 通过 KGlobalAccel D-Bus 注册快捷键并订阅 `globalShortcutPressed`。PySide6 无法序列化 `setShortcut` 的 `u` flags，因此设置快捷键通过 `gdbus`（优先）或 `dbus-send` 子进程完成；doRegister、setInactive 和信号订阅仍走 QtDBus。Wayland 没有全局鼠标监听，`mouse_pressed` 不会触发。
+
+默认快捷键 `ctrl+alt+d` 必须可配置。Wayland 下 KGlobalAccel 中已有的绑定优先保留（用户可在 System Settings 修改），配置文件中的 `hotkey` 在首次注册或配置变更时应用。
 
 `Controller` 负责配置热加载、快捷键重注册、选择层、后台流水线、贴图生命周期和点击外部关闭逻辑。
 
@@ -146,6 +172,8 @@ cd ~/tools/screenshot-translator
 ```
 
 `install.sh` 只在项目中创建 `.venv` 并安装 `requirements.txt`，不应使用 `sudo`，不应污染系统 Qt 路径。`--check` 不访问外部翻译服务；Umi-OCR 未运行但脚本存在时可以报告运行时自动启动警告。
+
+KDE Wayland 还需要系统已有 `spectacle`，以及 `gdbus`（glib2）或 `dbus-send`（dbus）之一；`install.sh` 不安装这些系统包。
 
 首次运行保持终端可见，先将配置设为：
 
@@ -165,14 +193,14 @@ target = "zh-CN"
 1. `python -m py_compile app.py`、`bash -n install.sh run.sh`、`git diff --check`。
 2. `./run.sh --check`。
 3. 前台程序启动无异常。
-4. `Ctrl+Alt+D` 显示覆盖整个屏幕的选择层，任务栏只出现一次。
-5. 拖选区域的显示像素、全局边界和 OCR 输入一致。
-6. 使用 `identity` 验证原位贴图。
-7. 验证原/译切换、复制原文、复制译文、`×`、`Esc`、点击外部、Alt+Tab、长按拖动和再次截图替换。
+4. `Ctrl+Alt+D` 显示覆盖整个屏幕的选择层（X11 下任务栏只出现一次；Wayland 下整屏变暗）。
+5. 拖选区域的显示像素、全局边界和 OCR 输入一致（Wayland 注意逻辑坐标×缩放 = 物理像素）。
+6. 使用 `identity` 验证原位贴图（Wayland 贴图应出现在选区原位置）。
+7. 验证原/译切换、复制原文、复制译文、`×`、`Esc`、点击外部、Alt+Tab、长按拖动和再次截图替换；Wayland 的 `Esc`/点击外部限制见上。
 8. 验证 OCR/翻译失败只通知和写日志。
 9. 最后单独测试 Google 或 LibreTranslate。
 
-在完整实测前不要声称全部功能可用。混合 DPI、多屏和 Wayland 仍未完成专门验证。
+在完整实测前不要声称全部功能可用。混合 DPI、多屏和 GNOME/wlroots 等非 KDE Wayland 尚未专门验证。
 
 ## 保护边界
 
@@ -183,6 +211,7 @@ target = "zh-CN"
 - 不增加主窗口、托盘图标、设置 GUI 或模态错误窗口，除非用户明确改变需求。
 - 不把 `.venv`、缓存、日志或个人配置提交到仓库。
 - 不使用 `git reset --hard`、`git clean -fd` 等会销毁未知修改的命令。
+- 不把 Wayland 的平台限制（点击外部关闭、Esc 焦点、多屏定位）描述成已修复；也不要在未在目标会话实测前宣称 Wayland 支持范围。
 
 ## Git 协作规范
 
@@ -219,11 +248,16 @@ target = "zh-CN"
 
 ## 当前工作起点
 
-环境安装和本地诊断已经完成。当前历史中已有：
+X11 与 KDE Plasma Wayland 的适配已经完成并验证到以下程度：
 
-```text
-7b72614 chore: 初始化截图翻译工具项目
-5fd821d fix(capture): 修复全屏选区与坐标偏移
-```
+- `./run.sh --check` 在 Arch + KDE Plasma Wayland 上 PASS（会话、spectacle、KGlobalAccel、Qt 屏幕、Umi-OCR、通知）。
+- KGlobalAccel 触发 → Spectacle 全屏抓取 → 全屏选择层（外部截图确认 85% 像素被暗化）已验证。
+- 合成鼠标事件端到端：框选逻辑坐标 (400,300,1001,521) → 物理裁剪 1501x782 → Umi-OCR 8 段 → `identity` 渲染 → Wayland 画布贴图位置与选区一致，画布外区域像素不变。
+- 尚未在真实鼠标/拖动/按钮操作下完成人工交互验收；`Esc` 焦点、点击外部关闭、多屏、混合缩放的 Wayland 行为仍未验证。
 
-选择层全屏和坐标修复已经通过静态检查、Qt 几何测试、运行日志和 `./run.sh --check` 验证。配置暂时使用 `identity` backend，Umi-OCR 可自动启动。接下来优先完成真实桌面交互验收，再单独验证真实翻译后端。
+后续优先事项：
+
+1. 在 Wayland 会话用真实鼠标完成一次完整交互验收（拖选、右键取消、太长/太短选区、贴图按钮、拖动、再次截图）。
+2. 用真实翻译后端（`google` 或 `google_cloud`）验证译图显示。
+3. 评估多屏与混合缩放；当前选择层固定在 Qt 主屏幕。
+4. 每次提交前按 Git 规范展示文件、diff 和提交消息并取得用户确认。
