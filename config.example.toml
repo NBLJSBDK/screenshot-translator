@@ -1,20 +1,26 @@
-# Screenshot Translator v0.1.1
+# Screenshot Translator v0.1.2
 # 实际配置：~/.config/screenshot-translator/config.toml
 # 修改后会自动重新加载；下一次截图使用新配置。
 
 [app]
-# X11 全局快捷键。
+# 全局快捷键。
+# X11：由 pynput 监听。
+# KDE Wayland：注册到 KGlobalAccel，也可以稍后在“系统设置 → 快捷键”中修改。
 hotkey = "ctrl+alt+d"
+# auto / pynput / kglobalaccel
+# auto：X11 用 pynput，Wayland 用 KGlobalAccel。
+input_backend = "auto"
 # 在贴图图像区域按住左键超过这个时间后，拖动即可移动整个贴图。
 drag_hold_ms = 350
 # 点击贴图和控制按钮以外的位置时关闭贴图。
+# 仅 X11 有效；Wayland 不允许全局鼠标监听，请用 × 或再次触发快捷键。
 close_on_outside_click = true
 
 [capture]
-# v0.1.1：Qt/X11 直接抓取桌面，再由本程序框选，以便精确得到 x/y/w/h。
-# 预留为后续可插拔截图后端。
-backend = "qt_x11"
-# 最小有效框选尺寸。
+# auto / qt_x11 / spectacle
+# auto：X11 用 qt_x11 直接抓屏，KDE Wayland 用 Spectacle 全屏抓取后再由本程序框选。
+backend = "auto"
+# 最小有效框选尺寸（逻辑像素）。
 min_width = 8
 min_height = 8
 

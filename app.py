@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Screenshot Translator v0.1.2
 
-KDE Plasma / Linux / X11 screenshot translation overlay.
+KDE Plasma / Linux screenshot translation overlay (X11 and Wayland).
 
 Default flow:
-    Ctrl+Alt+D -> Qt/X11 region selection -> Umi-OCR HTTP API
+    Ctrl+Alt+D -> region selection -> Umi-OCR HTTP API
     -> pluggable translation backend -> translated image over original region.
+
+X11 keeps the direct Qt/X11 grab and pynput global hotkey. KDE Plasma Wayland
+uses Spectacle fullscreen capture plus the KGlobalAccel D-Bus shortcut service.
 
 No main window and no tray icon. Failures use desktop notifications + log only.
 """
@@ -24,7 +27,7 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, NamedTuple
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,6 +42,14 @@ except Exception as exc:  # pragma: no cover - depends on desktop session
     mouse = None  # type: ignore[assignment]
     PYNPUT_IMPORT_ERROR = exc
 
+QDBUS_IMPORT_ERROR: Exception | None = None
+try:
+    from PySide6.QtDBus import QDBusConnection, QDBusMessage
+except Exception as exc:  # pragma: no cover - optional Qt module
+    QDBusConnection = None  # type: ignore[assignment]
+    QDBusMessage = None  # type: ignore[assignment]
+    QDBUS_IMPORT_ERROR = exc
+
 from PySide6.QtCore import (
     QFileSystemWatcher,
     QBuffer,
@@ -49,10 +60,12 @@ from PySide6.QtCore import (
     QPoint,
     QRect,
     QRectF,
+    QSize,
     Qt,
     QThread,
     QTimer,
     Signal,
+    Slot,
 )
 from PySide6.QtGui import (
     QColor,
@@ -65,6 +78,7 @@ from PySide6.QtGui import (
     QPainter,
     QPen,
     QPixmap,
+    QRegion,
 )
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QPushButton, QWidget
 
@@ -72,6 +86,25 @@ APP_NAME = "Screenshot Translator"
 APP_SLUG = "screenshot-translator"
 VERSION = "0.1.2"
 BASE_DIR = Path(__file__).resolve().parent
+
+SESSION_TYPE = os.environ.get("XDG_SESSION_TYPE", "").lower()
+IS_WAYLAND = SESSION_TYPE == "wayland" or (
+    SESSION_TYPE != "x11" and bool(os.environ.get("WAYLAND_DISPLAY"))
+)
+
+KGA_SERVICE = "org.kde.kglobalaccel"
+KGA_PATH = "/kglobalaccel"
+KGA_IFACE = "org.kde.KGlobalAccel"
+KGA_COMPONENT = "screenshot-translator"
+KGA_ACTION = "capture"
+KGA_COMPONENT_FRIENDLY = "Screenshot Translator"
+KGA_ACTION_FRIENDLY = "截图并翻译"
+KGA_COMPONENT_PATH = f"/component/{KGA_COMPONENT.replace('-', '_').replace('.', '_')}"
+KGA_COMPONENT_IFACE = "org.kde.kglobalaccel.Component"
+KGA_CAPTURE_ACTION_ID = [KGA_COMPONENT, KGA_ACTION, KGA_COMPONENT_FRIENDLY, KGA_ACTION_FRIENDLY]
+KGA_SET_PRESENT = 2
+KGA_NO_AUTOLOADING = 4
+KGA_SET_FLAGS = KGA_SET_PRESENT | KGA_NO_AUTOLOADING
 
 XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
 XDG_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
@@ -87,11 +120,12 @@ EXAMPLE_CONFIG = BASE_DIR / "config.example.toml"
 DEFAULTS: dict[str, Any] = {
     "app": {
         "hotkey": "ctrl+alt+d",
+        "input_backend": "auto",
         "drag_hold_ms": 350,
         "close_on_outside_click": True,
     },
     "capture": {
-        "backend": "qt_x11",
+        "backend": "auto",
         "min_width": 8,
         "min_height": 8,
     },
@@ -249,15 +283,27 @@ def image_to_png_bytes(image: QImage) -> bytes:
     return bytes(data)
 
 
-def capture_virtual_desktop() -> tuple[QRect, QImage]:
-    """Capture all Qt screens into one image using X11-backed QScreen.grabWindow()."""
+class CaptureResult(NamedTuple):
+    virtual: QRect  # logical virtual desktop rectangle
+    image: QImage  # captured desktop, physical pixels
+    scale_x: float  # image pixels per logical pixel
+    scale_y: float
+
+
+def virtual_desktop_rect() -> QRect:
     screens = QGuiApplication.screens()
     if not screens:
         raise RuntimeError("没有检测到屏幕")
-
     virtual = QRect(screens[0].geometry())
     for screen in screens[1:]:
         virtual = virtual.united(screen.geometry())
+    return virtual
+
+
+def capture_virtual_desktop() -> CaptureResult:
+    """Capture all Qt screens into one image using X11-backed QScreen.grabWindow()."""
+    screens = QGuiApplication.screens()
+    virtual = virtual_desktop_rect()
 
     image = QImage(virtual.size(), QImage.Format.Format_ARGB32)
     image.fill(Qt.GlobalColor.black)
@@ -280,27 +326,115 @@ def capture_virtual_desktop() -> tuple[QRect, QImage]:
             painter.drawImage(target, source_image)
     finally:
         painter.end()
-    return virtual, image
+    return CaptureResult(virtual, image, 1.0, 1.0)
+
+
+def _cleanup_old_captures() -> None:
+    try:
+        now = time.time()
+        for stale in CACHE_DIR.glob("wayland-capture-*.png"):
+            if now - stale.stat().st_mtime > 3600:
+                stale.unlink(missing_ok=True)
+    except Exception:
+        LOG.debug("capture cache cleanup failed", exc_info=True)
+
+
+def capture_desktop_spectacle() -> CaptureResult:
+    """KDE/Wayland capture: Spectacle grabs the full desktop before selection.
+
+    Wayland clients cannot read other surfaces, so the compositor-backed
+    Spectacle CLI is used. The returned image is in physical pixels while the
+    Qt screen geometry is in logical pixels; callers map between them with the
+    returned scale factors.
+    """
+    virtual = virtual_desktop_rect()
+    exe = shutil.which("spectacle")
+    if not exe:
+        raise RuntimeError("找不到 spectacle；KDE Wayland 截图需要安装 Spectacle")
+
+    ensure_runtime_dirs()
+    _cleanup_old_captures()
+    target = CACHE_DIR / f"wayland-capture-{os.getpid()}-{time.monotonic_ns()}.png"
+    try:
+        proc = subprocess.run(
+            [exe, "-b", "-n", "-f", "-o", str(target)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=45,
+        )
+        if proc.returncode != 0 or not target.exists():
+            detail = proc.stderr.decode("utf-8", "replace").strip()
+            raise RuntimeError(f"Spectacle 截图失败(code={proc.returncode}): {detail or '未生成文件'}")
+        data = target.read_bytes()
+        image = QImage.fromData(data, "PNG")
+        if image.isNull() or image.width() == 0 or image.height() == 0:
+            raise RuntimeError("Spectacle 返回了无法读取的截图")
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Spectacle 截图超时") from exc
+    finally:
+        target.unlink(missing_ok=True)
+
+    scale_x = image.width() / max(1, virtual.width())
+    scale_y = image.height() / max(1, virtual.height())
+    LOG.info(
+        "spectacle capture image=%dx%d virtual=%dx%d scale=%.4fx%.4f",
+        image.width(),
+        image.height(),
+        virtual.width(),
+        virtual.height(),
+        scale_x,
+        scale_y,
+    )
+    return CaptureResult(virtual, image, scale_x, scale_y)
+
+
+def effective_capture_backend(cfg: dict[str, Any]) -> str:
+    """Resolve capture.backend=auto and guard against X11-only grabs on Wayland."""
+    backend = str(cfg["capture"].get("backend", "auto")).strip().lower()
+    if backend == "auto":
+        return "spectacle" if IS_WAYLAND else "qt_x11"
+    if backend not in {"qt_x11", "spectacle"}:
+        raise RuntimeError(f"不支持的截图后端: {backend}")
+    if backend == "qt_x11" and IS_WAYLAND:
+        LOG.warning("capture backend qt_x11 does not work on Wayland; using spectacle")
+        return "spectacle"
+    return backend
+
+
+def capture_desktop(cfg: dict[str, Any]) -> CaptureResult:
+    if effective_capture_backend(cfg) == "spectacle":
+        return capture_desktop_spectacle()
+    return capture_virtual_desktop()
 
 
 class Selector(QWidget):
-    selected = Signal(object, object)  # QRect(global), QImage
+    selected = Signal(object, object)  # QRect(global logical), QImage(physical crop)
     cancelled = Signal()
 
     def __init__(self, cfg: dict[str, Any]) -> None:
         super().__init__()
         self.cfg = cfg
-        backend = str(cfg["capture"].get("backend", "qt_x11")).lower()
-        if backend != "qt_x11":
-            raise RuntimeError(f"v0.1.2 暂不支持截图后端: {backend}")
-        self.virtual, self.desktop = capture_virtual_desktop()
+        self.capture = capture_desktop(cfg)
+        self.virtual = self.capture.virtual
+        self.desktop = self.capture.image
+        self.scale_x = self.capture.scale_x
+        self.scale_y = self.capture.scale_y
         self.start: QPoint | None = None
         self.end: QPoint | None = None
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
         )
-        self.setGeometry(self.virtual)
+        if IS_WAYLAND:
+            # Wayland clients cannot position top-level windows. The selection
+            # surface is a fullscreen window on the target output; the capture
+            # image is mapped into its logical coordinate space.
+            screen = QGuiApplication.primaryScreen()
+            if screen is None:
+                raise RuntimeError("没有检测到屏幕")
+            self.setGeometry(screen.geometry())
+        else:
+            self.setGeometry(self.virtual)
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -308,38 +442,70 @@ class Selector(QWidget):
     def show_selector(self) -> None:
         # A normal top-level window can be constrained to the work area by
         # KWin, leaving the panel visible underneath the captured desktop.
-        # Full-screen state makes the selection surface cover the whole X11
-        # screen, including panels, so displayed pixels and mouse coordinates
-        # share the same origin.
-        self.setGeometry(self.virtual)
+        # Full-screen state makes the selection surface cover the whole screen,
+        # including panels, so displayed pixels and mouse coordinates share the
+        # same origin.
+        if IS_WAYLAND:
+            screen = QGuiApplication.primaryScreen()
+            if screen is not None:
+                self.setGeometry(screen.geometry())
+        else:
+            self.setGeometry(self.virtual)
         self.showFullScreen()
         self.raise_()
         self.activateWindow()
         self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+        QTimer.singleShot(0, self._log_activation)
+
+    def _log_activation(self) -> None:
+        LOG.info("selector shown fullscreen=%s active=%s", self.isFullScreen(), self.isActiveWindow())
 
     def selection_rect(self) -> QRect:
         if self.start is None or self.end is None:
             return QRect()
         return QRect(self.start, self.end).normalized()
 
+    def _window_origin(self) -> QPoint:
+        return self.mapToGlobal(QPoint(0, 0))
+
+    def _logical_to_physical(self, global_rect: QRect) -> QRect:
+        rel = global_rect.translated(-self.virtual.topLeft())
+        return QRect(
+            round(rel.x() * self.scale_x),
+            round(rel.y() * self.scale_y),
+            round(rel.width() * self.scale_x),
+            round(rel.height() * self.scale_y),
+        )
+
+    def _physical_to_logical(self, physical_rect: QRect) -> QRect:
+        return QRect(
+            self.virtual.x() + round(physical_rect.x() / self.scale_x),
+            self.virtual.y() + round(physical_rect.y() / self.scale_y),
+            round(physical_rect.width() / self.scale_x),
+            round(physical_rect.height() / self.scale_y),
+        )
+
     def paintEvent(self, _event) -> None:
         p = QPainter(self)
         p.fillRect(self.rect(), Qt.GlobalColor.black)
-        window_origin = self.mapToGlobal(QPoint(0, 0))
-        image_origin = window_origin - self.virtual.topLeft()
-        p.drawImage(-image_origin, self.desktop)
+        window_origin = self._window_origin()
+        visible_global = QRect(window_origin, self.size())
+        source_rect = self._logical_to_physical(visible_global).intersected(self.desktop.rect())
+        p.drawImage(self.rect(), self.desktop, source_rect)
         p.fillRect(self.rect(), QColor(0, 0, 0, 95))
 
         rect = self.selection_rect()
         if not rect.isNull() and rect.width() > 0 and rect.height() > 0:
             global_rect = QRect(window_origin + rect.topLeft(), rect.size())
-            source_rect = global_rect.translated(-self.virtual.topLeft())
-            p.drawImage(rect.topLeft(), self.desktop, source_rect)
+            selection_source = self._logical_to_physical(global_rect).intersected(self.desktop.rect())
+            # Scale the physical crop back into the logical selection rectangle;
+            # drawing it at 1:1 would oversize it by the physical/logical ratio.
+            p.drawImage(rect, self.desktop, selection_source)
             p.setPen(QPen(QColor(240, 240, 240), 2))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRect(rect.adjusted(0, 0, -1, -1))
 
-            label = f"{rect.width()} × {rect.height()}"
+            label = f"{selection_source.width()} × {selection_source.height()}"
             metrics = QFontMetricsF(self.font())
             label_rect = metrics.boundingRect(label).adjusted(-6, -4, 6, 4)
             x = min(max(4, rect.left()), max(4, self.width() - int(label_rect.width()) - 4))
@@ -380,17 +546,16 @@ class Selector(QWidget):
             self.update()
             return
 
-        window_origin = self.mapToGlobal(QPoint(0, 0))
+        window_origin = self._window_origin()
         global_rect = QRect(window_origin + rect.topLeft(), rect.size())
-        source_rect = global_rect.translated(-self.virtual.topLeft())
-        source_rect = source_rect.intersected(self.desktop.rect())
+        source_rect = self._logical_to_physical(global_rect).intersected(self.desktop.rect())
         if source_rect.width() < min_w or source_rect.height() < min_h:
             self.start = None
             self.end = None
             self.update()
             return
         crop = self.desktop.copy(source_rect)
-        global_rect = source_rect.translated(self.virtual.topLeft())
+        global_rect = self._physical_to_logical(source_rect)
         self.hide()
         self.selected.emit(global_rect, crop)
         self.close()
@@ -404,11 +569,21 @@ class Selector(QWidget):
 
 
 class LoadingWindow(QWidget):
-    """Small non-interactive spinner shown while OCR/translation is running."""
+    """Small non-interactive spinner shown while OCR/translation is running.
+
+    On Wayland a fullscreen transparent canvas is used because top-level
+    windows cannot be positioned; the spinner is painted at the selection
+    center and the input region is limited to the spinner itself.
+    """
+
+    SPINNER_SIZE = 34
 
     def __init__(self, image_global: QRect) -> None:
         super().__init__()
         self.angle = 0
+        self.canvas_mode = IS_WAYLAND
+        self.canvas_origin = QPoint(0, 0)
+        self.rect_local = QRect()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(80)
@@ -422,8 +597,25 @@ class LoadingWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setFixedSize(34, 34)
-        self._place(image_global)
+
+        if self.canvas_mode:
+            screen = (
+                QGuiApplication.screenAt(image_global.center())
+                or QGuiApplication.primaryScreen()
+            )
+            if screen is None:
+                raise RuntimeError("没有检测到屏幕")
+            self.canvas_origin = screen.geometry().topLeft()
+            self.setGeometry(screen.geometry())
+            self.rect_local = QRect(
+                image_global.center() - self.canvas_origin - QPoint(self.SPINNER_SIZE // 2, self.SPINNER_SIZE // 2),
+                QSize(self.SPINNER_SIZE, self.SPINNER_SIZE),
+            )
+            self.setMask(QRegion(self.rect_local))
+        else:
+            self.setFixedSize(self.SPINNER_SIZE, self.SPINNER_SIZE)
+            self.rect_local = QRect(0, 0, self.SPINNER_SIZE, self.SPINNER_SIZE)
+            self._place(image_global)
 
     def _place(self, image_global: QRect) -> None:
         center = image_global.center()
@@ -441,21 +633,24 @@ class LoadingWindow(QWidget):
         self.update()
 
     def show_loading(self) -> None:
+        if self.canvas_mode:
+            self.showFullScreen()
+            return
         self.show()
         self.raise_()
 
     def paintEvent(self, _event) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        margin = 1
+        rect = self.rect_local
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(20, 20, 20, 205))
-        p.drawEllipse(self.rect().adjusted(margin, margin, -margin, -margin))
+        p.drawEllipse(rect.adjusted(1, 1, -1, -1))
 
         pen = QPen(QColor(248, 248, 248, 245), 3)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         p.setPen(pen)
-        p.drawArc(self.rect().adjusted(9, 9, -9, -9), self.angle * 16, 270 * 16)
+        p.drawArc(rect.adjusted(9, 9, -9, -9), self.angle * 16, 270 * 16)
         p.end()
 
     def closeEvent(self, event) -> None:
@@ -799,11 +994,17 @@ class PipelineWorker(QThread):
 def fit_font(rect: QRectF, text: str, min_size: int, max_size: int) -> QFont:
     font = QFont(QGuiApplication.font())
     font.setWeight(QFont.Weight.Medium)
-    start = min(max_size, max(min_size, int(rect.height() * 0.58)))
+    # OCR boxes track the text ink, not the font line box; start from the box
+    # height and pick the largest size whose ink still fits.
+    start = min(max_size, max(min_size, int(rect.height())))
     flags = int(Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
     for size in range(start, min_size - 1, -1):
         font.setPixelSize(size)
         metrics = QFontMetricsF(font)
+        if "\n" not in text:
+            ink = metrics.tightBoundingRect(text)
+            if ink.width() <= rect.width() + 1 and ink.height() <= rect.height() + 2:
+                return QFont(font)
         br = metrics.boundingRect(rect, flags, text)
         if br.height() <= rect.height() and br.width() <= rect.width() + 1:
             return QFont(font)
@@ -811,14 +1012,22 @@ def fit_font(rect: QRectF, text: str, min_size: int, max_size: int) -> QFont:
     return font
 
 
-def render_translation(original: QImage, result: dict[str, Any], cfg: dict[str, Any]) -> QImage:
+def render_translation(
+    original: QImage,
+    result: dict[str, Any],
+    cfg: dict[str, Any],
+    scale: float = 1.0,
+) -> QImage:
     out = original.copy()
     p = QPainter(out)
     p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     ov = cfg["overlay"]
     mask_alpha = max(0, min(255, int(ov["mask_alpha"])))
-    min_size = int(ov["font_min_px"])
-    max_size = int(ov["font_max_px"])
+    # Font limits are configured in logical pixels; the image is in physical
+    # pixels, so scale them for the Wayland HiDPI case.
+    font_scale = max(0.1, float(scale))
+    min_size = max(1, int(round(int(ov["font_min_px"]) * font_scale)))
+    max_size = max(min_size, int(round(int(ov["font_max_px"]) * font_scale)))
     pad = max(0, int(ov.get("padding", 3)))
     radius = max(0, int(ov.get("corner_radius", 4)))
 
@@ -863,20 +1072,25 @@ class DraggableImage(QLabel):
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self.press_global = event.globalPosition().toPoint()
-            self.window_start = self.overlay.pos()
+            if self.overlay.canvas_mode:
+                self.overlay.begin_content_drag()
+            else:
+                self.window_start = self.overlay.pos()
             self.timer.start()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if (
             self.press_global is not None
-            and self.window_start is not None
             and (event.buttons() & Qt.MouseButton.LeftButton)
             and self.timer.isValid()
             and self.timer.elapsed() >= self.overlay.drag_hold_ms
         ):
             delta = event.globalPosition().toPoint() - self.press_global
-            self.overlay.move(self.window_start + delta)
+            if self.overlay.canvas_mode:
+                self.overlay.move_content(delta)
+            elif self.window_start is not None:
+                self.overlay.move(self.window_start + delta)
             self.setCursor(Qt.CursorShape.SizeAllCursor)
         super().mouseMoveEvent(event)
 
@@ -908,6 +1122,11 @@ class OverlayWindow(QWidget):
         self.cfg = cfg
         self.drag_hold_ms = int(cfg["app"]["drag_hold_ms"])
         self.showing_translation = True
+        self.canvas_mode = IS_WAYLAND
+        self.logical_size = global_rect.size()
+        self.canvas_origin = QPoint(0, 0)
+        self._drag_image_start = QPoint(0, 0)
+        self._drag_toolbar_start = QPoint(0, 0)
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -915,10 +1134,25 @@ class OverlayWindow(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        if self.canvas_mode:
+            # Wayland cannot position top-level windows; use a fullscreen
+            # transparent canvas and rely on the input region mask so clicks
+            # outside the overlay pass through to other applications.
+            self.setWindowFlag(Qt.WindowType.WindowDoesNotAcceptFocus, True)
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+            screen = (
+                QGuiApplication.screenAt(global_rect.center())
+                or QGuiApplication.primaryScreen()
+            )
+            if screen is None:
+                raise RuntimeError("没有检测到屏幕")
+            self.canvas_origin = screen.geometry().topLeft()
+            self.setGeometry(screen.geometry())
+        else:
+            self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self.image = DraggableImage(self)
-        self.image.setPixmap(QPixmap.fromImage(self.translated))
+        self.image.setPixmap(self._display_pixmap(self.translated))
         self.image.setScaledContents(False)
 
         self.toolbar = QWidget(self)
@@ -959,6 +1193,34 @@ class OverlayWindow(QWidget):
         )
         return btn
 
+    def _display_pixmap(self, image: QImage) -> QPixmap:
+        # Keep the physical-pixel image and declare its device pixel ratio so
+        # Qt maps it 1:1 onto the fractional-scaled surface. Pre-scaling to the
+        # logical size would resample the image twice and blur it.
+        pixmap = QPixmap.fromImage(image)
+        logical = self.logical_size
+        if logical.width() > 0 and logical.height() > 0:
+            ratio_x = image.width() / logical.width()
+            ratio_y = image.height() / logical.height()
+            if ratio_x > 0 and ratio_y > 0:
+                pixmap.setDevicePixelRatio((ratio_x + ratio_y) / 2)
+        return pixmap
+
+    def _update_mask(self) -> None:
+        if not self.canvas_mode:
+            return
+        region = QRegion(self.image.geometry()) | QRegion(self.toolbar.geometry())
+        self.setMask(region)
+
+    def begin_content_drag(self) -> None:
+        self._drag_image_start = self.image.pos()
+        self._drag_toolbar_start = self.toolbar.pos()
+
+    def move_content(self, delta: QPoint) -> None:
+        self.image.move(self._drag_image_start + delta)
+        self.toolbar.move(self._drag_toolbar_start + delta)
+        self._update_mask()
+
     def _place(self, image_global: QRect) -> None:
         self.toolbar.adjustSize()
         tw = self.toolbar.sizeHint().width()
@@ -990,6 +1252,13 @@ class OverlayWindow(QWidget):
         else:
             toolbar_global = inside
 
+        if self.canvas_mode:
+            self.image.setGeometry(image_global.translated(-self.canvas_origin))
+            self.toolbar.setGeometry(toolbar_global.translated(-self.canvas_origin))
+            self.toolbar.raise_()
+            self._update_mask()
+            return
+
         union = image_global.united(toolbar_global)
         self.setGeometry(union)
         self.image.setGeometry(image_global.translated(-union.topLeft()))
@@ -997,6 +1266,10 @@ class OverlayWindow(QWidget):
         self.toolbar.raise_()
 
     def show_overlay(self) -> None:
+        if self.canvas_mode:
+            self.showFullScreen()
+            self.raise_()
+            return
         self.show()
         self.raise_()
         self.activateWindow()
@@ -1005,7 +1278,7 @@ class OverlayWindow(QWidget):
     def toggle_view(self) -> None:
         self.showing_translation = not self.showing_translation
         image = self.translated if self.showing_translation else self.original
-        self.image.setPixmap(QPixmap.fromImage(image))
+        self.image.setPixmap(self._display_pixmap(image))
 
     def copy_source(self) -> None:
         QGuiApplication.clipboard().setText(self.source_text)
@@ -1014,7 +1287,7 @@ class OverlayWindow(QWidget):
         QGuiApplication.clipboard().setText(self.translated_text)
 
     def contains_global_point(self, point: QPoint) -> bool:
-        origin = self.mapToGlobal(QPoint(0, 0))
+        origin = self.canvas_origin if self.canvas_mode else self.mapToGlobal(QPoint(0, 0))
         image_rect = self.image.geometry().translated(origin)
         toolbar_rect = self.toolbar.geometry().translated(origin)
         return image_rect.contains(point) or toolbar_rect.contains(point)
@@ -1090,7 +1363,7 @@ class InputService(QObject):
         self._kbd_listener = keyboard.Listener(on_press=on_press, on_release=on_release)  # type: ignore[union-attr]
         self._kbd_listener.start()
         self.hotkey_text = hotkey_text
-        LOG.info("global hotkey=%s", hotkey_text)
+        LOG.info("global hotkey=%s backend=pynput", hotkey_text)
 
     def restart_hotkey(self, hotkey_text: str) -> None:
         if hotkey_text == self.hotkey_text:
@@ -1115,14 +1388,276 @@ class InputService(QObject):
             self._mouse_listener.stop()
 
 
+HOTKEY_MODIFIERS = {
+    "ctrl": 0x04000000,
+    "control": 0x04000000,
+    "alt": 0x08000000,
+    "shift": 0x02000000,
+    "super": 0x10000000,
+    "meta": 0x10000000,
+    "win": 0x10000000,
+    "cmd": 0x10000000,
+}
+
+HOTKEY_NAMES = {
+    "space": "Key_Space",
+    "tab": "Key_Tab",
+    "return": "Key_Return",
+    "enter": "Key_Return",
+    "escape": "Key_Escape",
+    "esc": "Key_Escape",
+    "backspace": "Key_Backspace",
+    "delete": "Key_Delete",
+    "del": "Key_Delete",
+    "insert": "Key_Insert",
+    "ins": "Key_Insert",
+    "home": "Key_Home",
+    "end": "Key_End",
+    "pageup": "Key_PageUp",
+    "pagedown": "Key_PageDown",
+    "up": "Key_Up",
+    "down": "Key_Down",
+    "left": "Key_Left",
+    "right": "Key_Right",
+    "minus": "Key_Minus",
+    "equal": "Key_Equal",
+    "plus": "Key_Plus",
+    "comma": "Key_Comma",
+    "period": "Key_Period",
+    "slash": "Key_Slash",
+    "semicolon": "Key_Semicolon",
+    "apostrophe": "Key_Apostrophe",
+    "grave": "Key_QuoteLeft",
+    "bracketleft": "Key_BracketLeft",
+    "bracketright": "Key_BracketRight",
+    "backslash": "Key_Backslash",
+}
+
+
+def hotkey_to_qt_key(text: str) -> int:
+    """Convert "ctrl+alt+d" into a Qt key sequence int used by KGlobalAccel."""
+    modifiers = 0
+    keys: list[int] = []
+    for raw in text.lower().replace(" ", "").replace("-", "+").split("+"):
+        if not raw:
+            continue
+        if raw in HOTKEY_MODIFIERS:
+            modifiers |= HOTKEY_MODIFIERS[raw]
+            continue
+        key_enum = None
+        if raw in HOTKEY_NAMES:
+            key_enum = getattr(Qt.Key, HOTKEY_NAMES[raw], None)
+        elif len(raw) == 1 and (raw.isalpha() or raw.isdigit()):
+            key_enum = getattr(Qt.Key, f"Key_{raw.upper()}", None)
+        elif raw.startswith("f") and raw[1:].isdigit():
+            key_enum = getattr(Qt.Key, f"Key_F{raw[1:]}", None)
+        if key_enum is None:
+            raise ValueError(f"不支持的快捷键按键: {raw}")
+        keys.append(int(key_enum.value))
+    if modifiers == 0 or not keys:
+        raise ValueError("快捷键至少包含一个修饰键和一个普通键")
+    if len(keys) != 1:
+        raise ValueError("快捷键只能包含一个普通键")
+    combined = modifiers | keys[0]
+    return combined
+
+
+def kglobalaccel_set_shortcut(keys: list[int], flags: int) -> None:
+    """Set a KGlobalAccel binding.
+
+    PySide6 cannot marshal the unsigned-int flags argument of
+    KGlobalAccel.setShortcut, so gdbus (which coerces types using the service
+    introspection data) or dbus-send is used for this single call.
+    """
+    action = json.dumps(list(KGA_CAPTURE_ACTION_ID), ensure_ascii=False)
+    key_array = "[" + ",".join(str(int(key)) for key in keys) + "]"
+    gdbus = shutil.which("gdbus")
+    if gdbus:
+        proc = subprocess.run(
+            [
+                gdbus, "call", "--session",
+                "--dest", KGA_SERVICE,
+                "--object-path", KGA_PATH,
+                "--method", f"{KGA_IFACE}.setShortcut",
+                action, key_array, str(int(flags)),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            detail = proc.stderr.decode("utf-8", "replace").strip()
+            raise RuntimeError(f"KGlobalAccel setShortcut 失败: {detail}")
+        return
+
+    dbus_send = shutil.which("dbus-send")
+    if dbus_send:
+        action_arg = "array:string:" + ",".join(f'"{value}"' for value in KGA_CAPTURE_ACTION_ID)
+        keys_arg = "array:int32:" + ",".join(str(int(key)) for key in keys)
+        proc = subprocess.run(
+            [
+                dbus_send, "--session", "--print-reply", f"--dest={KGA_SERVICE}", KGA_PATH,
+                f"{KGA_IFACE}.setShortcut",
+                action_arg, keys_arg, f"uint32:{int(flags)}",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            detail = proc.stderr.decode("utf-8", "replace").strip()
+            raise RuntimeError(f"KGlobalAccel setShortcut 失败: {detail}")
+        return
+
+    raise RuntimeError("需要 gdbus 或 dbus-send 来设置 KDE 全局快捷键")
+
+
+def kglobalaccel_get_shortcut() -> list[int]:
+    """Read the current KGlobalAccel binding for the capture action."""
+    action = json.dumps(list(KGA_CAPTURE_ACTION_ID), ensure_ascii=False)
+    gdbus = shutil.which("gdbus")
+    if gdbus:
+        proc = subprocess.run(
+            [
+                gdbus, "call", "--session",
+                "--dest", KGA_SERVICE,
+                "--object-path", KGA_PATH,
+                "--method", f"{KGA_IFACE}.shortcut",
+                action,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            payload = proc.stdout.decode("utf-8", "replace").strip().strip("()").rstrip(",")
+            payload = payload.strip("[]")
+            return [int(part) for part in payload.split(",") if part.strip()]
+
+    dbus_send = shutil.which("dbus-send")
+    if dbus_send:
+        action_arg = "array:string:" + ",".join(f'"{value}"' for value in KGA_CAPTURE_ACTION_ID)
+        proc = subprocess.run(
+            [
+                dbus_send, "--session", "--print-reply", f"--dest={KGA_SERVICE}", KGA_PATH,
+                f"{KGA_IFACE}.shortcut", action_arg,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            keys: list[int] = []
+            for line in proc.stdout.decode("utf-8", "replace").splitlines():
+                if "int32" in line:
+                    keys.append(int(line.split()[-1]))
+            return keys
+    return []
+
+
+class WaylandInputService(QObject):
+    """KDE global shortcuts through the KGlobalAccel D-Bus service.
+
+    Wayland compositors do not expose global keyboard/mouse input to clients,
+    so the hotkey is registered with KDE instead. Shortcut binding is owned by
+    KGlobalAccel and can also be changed in System Settings; the config hotkey
+    is applied on first registration and when the config changes.
+    """
+
+    hotkey_pressed = Signal()
+    mouse_pressed = Signal(int, int)  # global mouse monitoring is unavailable
+
+    def __init__(self, hotkey_text: str) -> None:
+        super().__init__()
+        if QDBusConnection is None or QDBusMessage is None:
+            raise RuntimeError(f"QtDBus 不可用: {QDBUS_IMPORT_ERROR}")
+        self.bus = QDBusConnection.sessionBus()
+        if not self.bus.isConnected():
+            raise RuntimeError("无法连接会话 D-Bus")
+        self.hotkey_text = hotkey_text
+        self._key = hotkey_to_qt_key(hotkey_text)
+        self._register()
+        ok = self.bus.connect(
+            KGA_SERVICE,
+            KGA_COMPONENT_PATH,
+            KGA_COMPONENT_IFACE,
+            "globalShortcutPressed",
+            self,
+            "1on_pressed(QString,QString,qlonglong)",
+        )
+        if not ok:
+            raise RuntimeError("无法订阅 KGlobalAccel globalShortcutPressed 信号")
+        LOG.info("global hotkey=%s backend=kglobalaccel key=%#x", hotkey_text, self._key)
+
+    def _call(self, path: str, interface: str, method: str, args: list[Any]) -> list[Any]:
+        message = QDBusMessage.createMethodCall(KGA_SERVICE, path, interface, method)
+        message.setArguments(args)
+        reply = self.bus.call(message)
+        if reply.type() == QDBusMessage.MessageType.ErrorMessage:
+            raise RuntimeError(f"KGlobalAccel {method} 失败: {reply.errorName()}: {reply.errorMessage()}")
+        return list(reply.arguments())
+
+    def _current_keys(self) -> list[int]:
+        return kglobalaccel_get_shortcut()
+
+    def _register(self) -> None:
+        self._call(KGA_PATH, KGA_IFACE, "doRegister", [list(KGA_CAPTURE_ACTION_ID)])
+        keys = self._current_keys()
+        key = int(keys[0]) if keys else int(self._key)
+        # Re-assert the binding with SetPresent so the daemon grabs the key in
+        # this session while keeping any binding customized in System Settings.
+        self._set_key(key)
+        if keys:
+            LOG.info("kglobalaccel kept existing shortcut key=%#x", self._key)
+
+    def _set_key(self, key: int) -> None:
+        kglobalaccel_set_shortcut([int(key)], KGA_SET_FLAGS)
+        keys = self._current_keys()
+        if int(key) not in [int(value) for value in keys]:
+            raise RuntimeError("KGlobalAccel 未接受快捷键；可能与其他全局快捷键冲突")
+        self._key = int(key)
+
+    @Slot(str, str, "qlonglong")
+    def on_pressed(self, component: str, shortcut: str, _timestamp: int) -> None:
+        if component == KGA_COMPONENT and shortcut == KGA_ACTION:
+            self.hotkey_pressed.emit()
+
+    def restart_hotkey(self, hotkey_text: str) -> None:
+        if hotkey_text == self.hotkey_text:
+            return
+        self._set_key(hotkey_to_qt_key(hotkey_text))
+        self.hotkey_text = hotkey_text
+        LOG.info("kglobalaccel shortcut updated key=%#x", self._key)
+
+    def stop(self) -> None:
+        try:
+            self._call(KGA_PATH, KGA_IFACE, "setInactive", [list(KGA_CAPTURE_ACTION_ID)])
+        except Exception:
+            LOG.debug("kglobalaccel setInactive failed", exc_info=True)
+
+
+def create_input_service(cfg: dict[str, Any]) -> QObject:
+    hotkey = str(cfg["app"]["hotkey"])
+    mode = str(cfg["app"].get("input_backend", "auto")).strip().lower()
+    if mode == "auto":
+        mode = "kglobalaccel" if IS_WAYLAND else "pynput"
+    if mode == "kglobalaccel":
+        return WaylandInputService(hotkey)
+    if mode == "pynput":
+        return InputService(hotkey)
+    raise RuntimeError(f"不支持的输入后端: {mode}")
+
+
 class Controller(QObject):
     def __init__(self, app: QApplication) -> None:
         super().__init__()
         self.app = app
         self.cfg = load_config()
-        self.input = InputService(str(self.cfg["app"]["hotkey"]))
+        self.input = create_input_service(self.cfg)
         self.input.hotkey_pressed.connect(self.trigger)
         self.input.mouse_pressed.connect(self.global_mouse_press)
+        if IS_WAYLAND and bool(self.cfg["app"].get("close_on_outside_click", True)):
+            LOG.info("Wayland: 点击贴图外部关闭不可用；请使用 × 或重新触发快捷键")
         self.selector: Selector | None = None
         self.loading: LoadingWindow | None = None
         self.overlay: OverlayWindow | None = None
@@ -1220,7 +1755,13 @@ class Controller(QObject):
         try:
             if self.pending_image is None or self.pending_rect is None:
                 raise RuntimeError("内部状态丢失")
-            translated_image = render_translation(self.pending_image, result, self.cfg)
+            scale = 1.0
+            if self.pending_rect.width() > 0 and self.pending_rect.height() > 0:
+                scale = (
+                    self.pending_image.width() / self.pending_rect.width()
+                    + self.pending_image.height() / self.pending_rect.height()
+                ) / 2
+            translated_image = render_translation(self.pending_image, result, self.cfg, scale)
             self.overlay = OverlayWindow(
                 self.pending_rect,
                 self.pending_image,
@@ -1285,6 +1826,36 @@ def ocr_options_url(cfg: dict[str, Any]) -> str:
     return api_url.rsplit("/", 1)[0] + "/get_options"
 
 
+def kglobalaccel_available() -> bool:
+    if QDBusConnection is None or QDBusMessage is None:
+        return False
+    try:
+        bus = QDBusConnection.sessionBus()
+        if not bus.isConnected():
+            return False
+        message = QDBusMessage.createMethodCall(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameHasOwner",
+        )
+        message.setArguments([KGA_SERVICE])
+        reply = bus.call(message)
+        args = reply.arguments()
+        if args and bool(args[0]):
+            return True
+    except Exception:
+        LOG.debug("kglobalaccel availability probe failed", exc_info=True)
+    for path in (
+        Path("/usr/share/dbus-1/services/org.kde.kglobalaccel.service"),
+        Path("/usr/lib/kglobalacceld"),
+        Path("/etc/xdg/autostart/kglobalacceld.desktop"),
+    ):
+        if path.exists():
+            return True
+    return shutil.which("kglobalacceld") is not None
+
+
 def run_check(app: QApplication, cfg: dict[str, Any]) -> int:
     critical = 0
     print(f"{APP_NAME} {VERSION}")
@@ -1296,15 +1867,58 @@ def run_check(app: QApplication, cfg: dict[str, Any]) -> int:
     session = os.environ.get("XDG_SESSION_TYPE", "").lower()
     display = os.environ.get("DISPLAY", "")
     if session == "x11" and display:
-        print(f"X11: OK ({display})")
+        print(f"会话: OK (x11 {display})")
+    elif IS_WAYLAND:
+        desktop = os.environ.get("XDG_CURRENT_DESKTOP", "")
+        print(f"会话: OK (wayland {desktop})")
     else:
-        print(f"X11: FAIL (XDG_SESSION_TYPE={session or 'unknown'}, DISPLAY={display or 'empty'})")
+        print(f"会话: FAIL (XDG_SESSION_TYPE={session or 'unknown'})")
         critical += 1
 
-    if PYNPUT_IMPORT_ERROR is None:
-        print("全局输入监听(pynput): OK")
+    try:
+        capture_backend = effective_capture_backend(cfg)
+    except Exception as exc:
+        capture_backend = None
+        print(f"截图后端: FAIL ({exc})")
+        critical += 1
+    if capture_backend == "qt_x11":
+        if display:
+            print("截图后端: OK (qt_x11)")
+        else:
+            print("截图后端: FAIL (qt_x11 需要 X11 DISPLAY)")
+            critical += 1
+    elif capture_backend == "spectacle":
+        spectacle = shutil.which("spectacle")
+        if spectacle:
+            print(f"截图后端: OK (spectacle: {spectacle})")
+        else:
+            print("截图后端: FAIL (KDE Wayland 需要 spectacle)")
+            critical += 1
+
+    input_mode = str(cfg["app"].get("input_backend", "auto")).strip().lower()
+    if input_mode == "auto":
+        input_mode = "kglobalaccel" if IS_WAYLAND else "pynput"
+    if input_mode == "pynput":
+        if PYNPUT_IMPORT_ERROR is None:
+            print("全局快捷键(pynput): OK")
+        else:
+            print(f"全局快捷键(pynput): FAIL ({PYNPUT_IMPORT_ERROR})")
+            critical += 1
+    elif input_mode == "kglobalaccel":
+        if QDBUS_IMPORT_ERROR is not None:
+            print(f"全局快捷键(KGlobalAccel): FAIL (QtDBus 不可用: {QDBUS_IMPORT_ERROR})")
+            critical += 1
+        elif not kglobalaccel_available():
+            print("全局快捷键(KGlobalAccel): FAIL (未找到 org.kde.kglobalaccel)")
+            critical += 1
+        elif not (shutil.which("gdbus") or shutil.which("dbus-send")):
+            print("全局快捷键(KGlobalAccel): FAIL (需要 gdbus 或 dbus-send 设置快捷键)")
+            critical += 1
+        else:
+            tool = shutil.which("gdbus") or shutil.which("dbus-send")
+            print(f"全局快捷键(KGlobalAccel): OK (KDE D-Bus, {tool})")
     else:
-        print(f"全局输入监听(pynput): FAIL ({PYNPUT_IMPORT_ERROR})")
+        print(f"全局快捷键: FAIL (不支持的输入后端 {input_mode})")
         critical += 1
 
     screens = QGuiApplication.screens()
@@ -1316,13 +1930,6 @@ def run_check(app: QApplication, cfg: dict[str, Any]) -> int:
         print(f"Qt 屏幕: OK ({desc})")
     else:
         print("Qt 屏幕: FAIL")
-        critical += 1
-
-    backend = str(cfg["capture"].get("backend", "qt_x11"))
-    if backend == "qt_x11":
-        print("截图后端: OK (qt_x11)")
-    else:
-        print(f"截图后端: FAIL ({backend})")
         critical += 1
 
     umi_script = Path(os.path.expanduser(str(cfg["ocr"]["umi_ocr"]))).resolve()
@@ -1360,7 +1967,7 @@ def run_check(app: QApplication, cfg: dict[str, Any]) -> int:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="KDE/X11 screenshot translation overlay")
+    parser = argparse.ArgumentParser(description="KDE screenshot translation overlay (X11/Wayland)")
     parser.add_argument("--check", action="store_true", help="检查本地运行环境，不调用外部翻译服务")
     parser.add_argument("--config-path", action="store_true", help="只打印配置文件路径")
     parser.add_argument("--keys-path", action="store_true", help="只打印密钥配置文件路径")
@@ -1384,12 +1991,8 @@ def main() -> int:
         print(LOG_PATH)
         return 0
 
-    session = os.environ.get("XDG_SESSION_TYPE", "").lower()
-    if session == "wayland":
-        print(f"{APP_NAME} {VERSION} 目前只支持 X11。", file=sys.stderr)
-        return 2
-    if not os.environ.get("DISPLAY"):
-        print("没有 DISPLAY；需要在图形化 X11 会话中运行。", file=sys.stderr)
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        print("没有图形会话；需要在 KDE/X11 或 KDE/Wayland 中运行。", file=sys.stderr)
         return 2
 
     app = QApplication(sys.argv[:1])
