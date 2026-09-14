@@ -1,4 +1,4 @@
-# Screenshot Translator v0.2.1
+# Screenshot Translator v0.3.0
 
 面向 **KDE Plasma + Linux** 的无主窗口截图翻译贴片器，支持 X11 与 KDE Plasma Wayland 会话。
 

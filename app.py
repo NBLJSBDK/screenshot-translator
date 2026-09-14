@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Screenshot Translator v0.2.1
+"""Screenshot Translator v0.3.0
 
 KDE Plasma / Linux screenshot translation overlay (X11 and Wayland).
 
@@ -97,7 +97,7 @@ from PySide6.QtWidgets import (
 
 APP_NAME = "Screenshot Translator"
 APP_SLUG = "screenshot-translator"
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 BASE_DIR = Path(__file__).resolve().parent
 
 SESSION_TYPE = os.environ.get("XDG_SESSION_TYPE", "").lower()
