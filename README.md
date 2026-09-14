@@ -168,17 +168,72 @@ target = "zh-CN"
 
 `auto` 会按当前会话自动选择：X11 使用 `qt_x11` + `pynput`，KDE Wayland 使用 `spectacle` + `kglobalaccel`。在 Wayland 下 `close_on_outside_click` 不生效。
 
-### 使用 F13–F24 作为快捷键（KDE Wayland）
+### 使用 F13–F24 作为快捷键
 
-KDE 默认把 F13–F24 映射成 `XF86Tools` / `XF86Launch5` 等多媒体键，快捷键匹配不到。先启用系统选项并注销重登：
+系统默认的 xkb `inet` 映射会把 FK13–FK18 等映射成 `XF86Tools`、`XF86Launch5` 等多媒体键，KGlobalAccel/KDE 里配的 F13–F24 永远匹配不到。需要先让这些键发送真正的 F13–F24。
+
+**KDE Plasma Wayland：**
 
 ```bash
 sudo localectl set-x11-keymap us pc105 "" fkeys:basic_13-24
 kwriteconfig6 --file kxkbrc --group Layout --key Options "fkeys:basic_13-24"
 kwriteconfig6 --file kxkbrc --group Layout --key ResetOldOptions true
+# 注销重新登录后生效（KWin 只在启动时重建键位表）
 ```
 
-之后把配置写成例如 `hotkey = "f13"`、`copy_hotkey = "f14"` 即可。
+注意：KWin 读取 kxkbrc 的 `Options` 时要求 `ResetOldOptions=true`，否则选项会被忽略。
+
+**KDE Plasma X11 / Debian：**
+
+```bash
+# 当前会话立即生效
+setxkbmap -option fkeys:basic_13-24
+
+# 开机默认
+sudo sed -i 's/^XKBOPTIONS=.*/XKBOPTIONS="fkeys:basic_13-24"/' /etc/default/keyboard
+sudo dpkg-reconfigure keyboard-configuration   # 或重启
+```
+
+KDE X11 也可以在「系统设置 → 输入设备 → 键盘 → 布局 → 高级」勾选 “Use F13-F24 as usual function keys”。
+
+**自定义某个 FK 键的行为（用户级 xkb，不动系统包文件）：**
+
+例如把 FK16 改成右 Ctrl、其余保持 F 键：
+
+```bash
+mkdir -p ~/.config/xkb/symbols ~/.config/xkb/rules
+cat > ~/.config/xkb/symbols/screenshot <<'EOF'
+partial alphanumeric_keys modifier_keys
+xkb_symbols "fkeys" {
+    key <FK13> { [ F13 ] };
+    key <FK14> { [ F14 ] };
+    key <FK15> { [ F15 ] };
+    key <FK16> { [ Control_R ] };
+    key <FK17> { [ F17 ] };
+    key <FK18> { [ F18 ] };
+    key <FK19> { [ F19 ] };
+    key <FK20> { [ F20 ] };
+    key <FK21> { [ F21 ] };
+    key <FK22> { [ F22 ] };
+    key <FK23> { [ F23 ] };
+    key <FK24> { [ F24 ] };
+};
+EOF
+cp /usr/share/X11/xkb/rules/evdev ~/.config/xkb/rules/evdev
+# 在规则文件的 "! option = symbols" 段追加：
+#   screenshot:fkeys = +screenshot(fkeys)
+# 然后系统选项使用自定义名字：
+sudo localectl set-x11-keymap us pc105 "" screenshot:fkeys
+```
+
+验证键位映射：
+
+```bash
+xkbcli compile-keymap --rules evdev --model pc105 --layout us --options screenshot:fkeys | grep "FK1[3-6]"
+xev        # X11：按 F14 应显示 keysym 0xffcb (F14)
+```
+
+之后把配置写成例如 `hotkey = "f13"`、`copy_hotkey = "f14"` 即可。xkb 的 layout/options 改动在 KDE Wayland 下需要注销重登才生效。
 
 只英译中：
 
