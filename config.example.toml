@@ -1,13 +1,22 @@
-# Screenshot Translator v0.3.0
+# Screenshot Translator v0.3.1
 # 实际配置：~/.config/screenshot-translator/config.toml
 # 修改后会自动重新加载；下一次截图使用新配置。
 
 [app]
-# 全局快捷键。
-# X11：由 pynput 监听。
-# KDE Wayland：注册到 KGlobalAccel，也可以稍后在“系统设置 → 快捷键”中修改。
+# 全局快捷键写法：
+#   组合键： "ctrl+alt+d"、"super+shift+f1"、"ctrl+shift+space"
+#   修饰键： ctrl / alt / shift / super（meta、win、cmd 与 super 相同）
+#   普通键： 单个字母或数字 a-z、0-9；功能键 F1-F24
+#   特殊键： space、tab、enter、escape、backspace、delete、insert、
+#            home、end、pageup、pagedown、up、down、left、right
+#   分隔符： +、- 或空格均可，大小写不敏感
+#   无修饰键时只允许 F13-F24（例如 "f13"），避免抢占正常输入
+#   平台差异： KDE Wayland 全部支持；X11/pynput 的功能键最高 F20
+#   写入方式： KDE Wayland 会注册到 KGlobalAccel，以本配置为准
+#
+# 截图并翻译：
 hotkey = "ctrl+alt+d"
-# 第二个快捷键：只调用 Umi-OCR 识别并自动把原文复制到剪贴板（不翻译）。留空禁用。
+# 截图并只识别、复制原文（不翻译）；留空 "" 表示禁用：
 copy_hotkey = "super+ctrl+shift+o"
 # auto / pynput / kglobalaccel
 # auto：X11 用 pynput，Wayland 用 KGlobalAccel。

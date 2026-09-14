@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Screenshot Translator v0.3.0
+"""Screenshot Translator v0.3.1
 
 KDE Plasma / Linux screenshot translation overlay (X11 and Wayland).
 
@@ -97,7 +97,7 @@ from PySide6.QtWidgets import (
 
 APP_NAME = "Screenshot Translator"
 APP_SLUG = "screenshot-translator"
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 BASE_DIR = Path(__file__).resolve().parent
 
 SESSION_TYPE = os.environ.get("XDG_SESSION_TYPE", "").lower()
@@ -1563,20 +1563,55 @@ class InputService(QObject):
             "meta": "<cmd>",
             "win": "<cmd>",
         }
+        special_keys = {
+            "space": "<space>",
+            "tab": "<tab>",
+            "enter": "<enter>",
+            "return": "<enter>",
+            "escape": "<esc>",
+            "esc": "<esc>",
+            "backspace": "<backspace>",
+            "delete": "<delete>",
+            "del": "<delete>",
+            "insert": "<insert>",
+            "ins": "<insert>",
+            "home": "<home>",
+            "end": "<end>",
+            "pageup": "<page_up>",
+            "pagedown": "<page_down>",
+            "up": "<up>",
+            "down": "<down>",
+            "left": "<left>",
+            "right": "<right>",
+        }
         parts: list[str] = []
+        key_tokens: list[str] = []
+        modifier_count = 0
         for raw in text.lower().replace(" ", "").replace("-", "+").split("+"):
             if not raw:
                 continue
             if raw in aliases:
                 parts.append(aliases[raw])
+                modifier_count += 1
+            elif raw in special_keys:
+                parts.append(special_keys[raw])
+                key_tokens.append(raw)
             elif raw.startswith("f") and raw[1:].isdigit():
+                if int(raw[1:]) > 20:
+                    raise ValueError(f"pynput 不支持 F{raw[1:]}；请使用 F1-F20")
                 parts.append(f"<{raw}>")
+                key_tokens.append(raw)
             elif len(raw) == 1:
                 parts.append(raw)
+                key_tokens.append(raw)
             else:
                 raise ValueError(f"不支持的快捷键按键: {raw}")
-        if len(parts) < 2:
-            raise ValueError("快捷键至少包含一个修饰键和一个普通键")
+        if not key_tokens:
+            raise ValueError("快捷键至少包含一个普通键")
+        if modifier_count == 0 and not (
+            len(key_tokens) == 1 and extra_function_key_number(key_tokens[0]) is not None
+        ):
+            raise ValueError("无修饰键时只能使用 F13-F24")
         return "+".join(parts)
 
     def _start_keyboard(self) -> None:
@@ -1649,6 +1684,16 @@ HOTKEY_MODIFIERS = {
     "cmd": 0x10000000,
 }
 
+
+def extra_function_key_number(token: str) -> int | None:
+    """Return 13..24 for bare F13-F24 keys (safe without modifiers)."""
+    token = token.strip("<>").lower()
+    if token.startswith("f") and token[1:].isdigit():
+        number = int(token[1:])
+        if 13 <= number <= 24:
+            return number
+    return None
+
 HOTKEY_NAMES = {
     "space": "Key_Space",
     "tab": "Key_Tab",
@@ -1688,6 +1733,7 @@ def hotkey_to_qt_key(text: str) -> int:
     """Convert "ctrl+alt+d" into a Qt key sequence int used by KGlobalAccel."""
     modifiers = 0
     keys: list[int] = []
+    key_tokens: list[str] = []
     for raw in text.lower().replace(" ", "").replace("-", "+").split("+"):
         if not raw:
             continue
@@ -1704,10 +1750,13 @@ def hotkey_to_qt_key(text: str) -> int:
         if key_enum is None:
             raise ValueError(f"不支持的快捷键按键: {raw}")
         keys.append(int(key_enum.value))
-    if modifiers == 0 or not keys:
-        raise ValueError("快捷键至少包含一个修饰键和一个普通键")
+        key_tokens.append(raw)
+    if not keys:
+        raise ValueError("快捷键至少包含一个普通键")
     if len(keys) != 1:
         raise ValueError("快捷键只能包含一个普通键")
+    if modifiers == 0 and extra_function_key_number(key_tokens[0]) is None:
+        raise ValueError("无修饰键时只能使用 F13-F24")
     combined = modifiers | keys[0]
     return combined
 
@@ -1861,13 +1910,9 @@ class WaylandInputService(QObject):
         if not text:
             self._set_inactive(action)
             return
-        keys = kglobalaccel_get_shortcut(action)
-        key = int(keys[0]) if keys else hotkey_to_qt_key(text)
-        # Re-assert the binding with SetPresent so the daemon grabs the key in
-        # this session while keeping any binding customized in System Settings.
-        self._set_key(action, key)
-        if keys:
-            LOG.info("kglobalaccel kept existing %s key=%#x", action, key)
+        # Config is authoritative: apply the configured key on every start so
+        # editing config.toml always takes effect.
+        self._set_key(action, hotkey_to_qt_key(text))
 
     def _set_inactive(self, action: str) -> None:
         try:
