@@ -1,4 +1,4 @@
-# Screenshot Translator v0.3.1
+# Screenshot Translator v0.3.2
 # 实际配置：~/.config/screenshot-translator/config.toml
 # 修改后会自动重新加载；下一次截图使用新配置。
 
@@ -16,10 +16,10 @@
 #   平台差异： KDE Wayland 全部支持；X11/pynput 的功能键最高 F20
 #   写入方式： KDE Wayland 会注册到 KGlobalAccel，以本配置为准
 #
-# 截图并翻译：
-hotkey = "ctrl+alt+d"
+# 截图并翻译（默认 F14；使用 F13-F24 前先按上面的提示启用系统键位选项）：
+hotkey = "f14"
 # 截图并只识别、复制原文（不翻译）；留空 "" 表示禁用：
-copy_hotkey = "super+ctrl+shift+o"
+copy_hotkey = "f15"
 # auto / pynput / kglobalaccel
 # auto：X11 用 pynput，Wayland 用 KGlobalAccel。
 input_backend = "auto"

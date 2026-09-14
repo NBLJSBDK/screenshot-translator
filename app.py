@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Screenshot Translator v0.3.1
+"""Screenshot Translator v0.3.2
 
 KDE Plasma / Linux screenshot translation overlay (X11 and Wayland).
 
 Default flow:
-    Ctrl+Alt+D -> region selection -> Umi-OCR HTTP API
+    F14 -> region selection -> Umi-OCR HTTP API
     -> pluggable translation backend -> translated image over original region.
+    F15 -> region selection -> Umi-OCR only -> source text copied to clipboard.
 
 X11 keeps the direct Qt/X11 grab and pynput global hotkey. KDE Plasma Wayland
 uses Spectacle fullscreen capture plus the KGlobalAccel D-Bus shortcut service.
@@ -97,7 +98,7 @@ from PySide6.QtWidgets import (
 
 APP_NAME = "Screenshot Translator"
 APP_SLUG = "screenshot-translator"
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 BASE_DIR = Path(__file__).resolve().parent
 
 SESSION_TYPE = os.environ.get("XDG_SESSION_TYPE", "").lower()
@@ -139,8 +140,8 @@ EXAMPLE_CONFIG = BASE_DIR / "config.example.toml"
 
 DEFAULTS: dict[str, Any] = {
     "app": {
-        "hotkey": "ctrl+alt+d",
-        "copy_hotkey": "super+ctrl+shift+o",
+        "hotkey": "f14",
+        "copy_hotkey": "f15",
         "input_backend": "auto",
         "tray_icon": True,
         "drag_hold_ms": 0,
