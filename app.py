@@ -109,15 +109,22 @@ KGA_SERVICE = "org.kde.kglobalaccel"
 KGA_PATH = "/kglobalaccel"
 KGA_IFACE = "org.kde.KGlobalAccel"
 KGA_COMPONENT = "screenshot-translator"
-KGA_ACTION = "capture"
 KGA_COMPONENT_FRIENDLY = "Screenshot Translator"
-KGA_ACTION_FRIENDLY = "截图并翻译"
+TRAY_TOOLTIP = "截图翻译贴片"
 KGA_COMPONENT_PATH = f"/component/{KGA_COMPONENT.replace('-', '_').replace('.', '_')}"
 KGA_COMPONENT_IFACE = "org.kde.kglobalaccel.Component"
-KGA_CAPTURE_ACTION_ID = [KGA_COMPONENT, KGA_ACTION, KGA_COMPONENT_FRIENDLY, KGA_ACTION_FRIENDLY]
+KGA_ACTIONS: dict[str, tuple[str, str]] = {
+    "capture": ("截图并翻译", "hotkey"),
+    "copy": ("截图并复制原文", "copy_hotkey"),
+}
 KGA_SET_PRESENT = 2
 KGA_NO_AUTOLOADING = 4
 KGA_SET_FLAGS = KGA_SET_PRESENT | KGA_NO_AUTOLOADING
+
+
+def kglobalaccel_action_id(action: str) -> list[str]:
+    friendly = KGA_ACTIONS[action][0]
+    return [KGA_COMPONENT, action, KGA_COMPONENT_FRIENDLY, friendly]
 
 XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
 XDG_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
@@ -133,6 +140,7 @@ EXAMPLE_CONFIG = BASE_DIR / "config.example.toml"
 DEFAULTS: dict[str, Any] = {
     "app": {
         "hotkey": "ctrl+alt+d",
+        "copy_hotkey": "super+ctrl+shift+o",
         "input_backend": "auto",
         "tray_icon": True,
         "drag_hold_ms": 0,
@@ -151,6 +159,8 @@ DEFAULTS: dict[str, Any] = {
         "request_timeout_s": 20.0,
         "language": "models/config_chinese.txt",
         "parser": "multi_para",
+        # 只识别不翻译时单独使用的排版解析方案；留空则沿用 parser。
+        "copy_parser": "",
         "limit_side_len": 2880,
     },
     "translation": {
@@ -808,11 +818,20 @@ class PipelineWorker(QThread):
     done = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, png: bytes, cfg: dict[str, Any], keys: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        png: bytes,
+        cfg: dict[str, Any],
+        keys: dict[str, Any] | None = None,
+        translate: bool = True,
+        parser_override: str | None = None,
+    ) -> None:
         super().__init__()
         self.png = png
         self.cfg = cfg
         self.keys = keys or {}
+        self.translate = translate
+        self.parser_override = parser_override
 
     def run(self) -> None:
         try:
@@ -824,6 +843,17 @@ class PipelineWorker(QThread):
             ).strip()
             if not source_text:
                 raise RuntimeError("没有识别到文字")
+
+            if not self.translate:
+                self.done.emit(
+                    {
+                        "source_text": source_text,
+                        "translated_text": "",
+                        "paragraphs": [],
+                        "elapsed": time.monotonic() - started,
+                    }
+                )
+                return
 
             paragraphs = self._make_paragraphs(blocks)
             paragraphs = [para for para in paragraphs if str(para["text"]).strip()]
@@ -927,12 +957,13 @@ class PipelineWorker(QThread):
 
     def _ocr(self) -> list[dict[str, Any]]:
         ocr_cfg = self.cfg["ocr"]
+        parser = self.parser_override or str(ocr_cfg["parser"])
         payload = {
             "base64": base64.b64encode(self.png).decode("ascii"),
             "options": {
                 "ocr.language": str(ocr_cfg["language"]),
                 "ocr.limit_side_len": int(ocr_cfg["limit_side_len"]),
-                "tbpu.parser": str(ocr_cfg["parser"]),
+                "tbpu.parser": parser,
                 "data.format": "dict",
             },
         }
@@ -1507,17 +1538,18 @@ class OverlayWindow(QWidget):
 
 class InputService(QObject):
     hotkey_pressed = Signal()
+    copy_hotkey_pressed = Signal()
     mouse_pressed = Signal(int, int)
 
-    def __init__(self, hotkey_text: str) -> None:
+    def __init__(self, capture_text: str, copy_text: str) -> None:
         super().__init__()
         if keyboard is None or mouse is None:
             raise RuntimeError(f"pynput 初始化失败: {PYNPUT_IMPORT_ERROR}")
-        self.hotkey_text = ""
+        self.hotkey_texts = {"capture": capture_text.strip(), "copy": copy_text.strip()}
         self._kbd_listener = None
-        self._hotkey = None
+        self._hotkeys: list[Any] = []
         self._mouse_listener = None
-        self._start_keyboard(hotkey_text)
+        self._start_keyboard()
         self._start_mouse()
 
     @staticmethod
@@ -1547,33 +1579,49 @@ class InputService(QObject):
             raise ValueError("快捷键至少包含一个修饰键和一个普通键")
         return "+".join(parts)
 
-    def _start_keyboard(self, hotkey_text: str) -> None:
-        normalized = self._normalize_hotkey(hotkey_text)
-        self._hotkey = keyboard.HotKey(  # type: ignore[union-attr]
-            keyboard.HotKey.parse(normalized),  # type: ignore[union-attr]
-            self.hotkey_pressed.emit,
-        )
+    def _start_keyboard(self) -> None:
+        signals = {"capture": self.hotkey_pressed, "copy": self.copy_hotkey_pressed}
+        self._hotkeys = []
+        for action, text in self.hotkey_texts.items():
+            if not text:
+                continue
+            normalized = self._normalize_hotkey(text)
+            hotkey = keyboard.HotKey(  # type: ignore[union-attr]
+                keyboard.HotKey.parse(normalized),  # type: ignore[union-attr]
+                signals[action].emit,
+            )
+            self._hotkeys.append(hotkey)
 
         def on_press(key) -> None:
-            if self._kbd_listener is not None and self._hotkey is not None:
-                self._hotkey.press(self._kbd_listener.canonical(key))
+            if self._kbd_listener is not None:
+                canonical = self._kbd_listener.canonical(key)
+                for hotkey in self._hotkeys:
+                    hotkey.press(canonical)
 
         def on_release(key) -> None:
-            if self._kbd_listener is not None and self._hotkey is not None:
-                self._hotkey.release(self._kbd_listener.canonical(key))
+            if self._kbd_listener is not None:
+                canonical = self._kbd_listener.canonical(key)
+                for hotkey in self._hotkeys:
+                    hotkey.release(canonical)
 
         self._kbd_listener = keyboard.Listener(on_press=on_press, on_release=on_release)  # type: ignore[union-attr]
         self._kbd_listener.start()
-        self.hotkey_text = hotkey_text
-        LOG.info("global hotkey=%s backend=pynput", hotkey_text)
+        LOG.info(
+            "global hotkeys=%s backend=pynput capture=%s copy=%s",
+            list(self.hotkey_texts.values()),
+            self.hotkey_texts["capture"] or "off",
+            self.hotkey_texts["copy"] or "off",
+        )
 
-    def restart_hotkey(self, hotkey_text: str) -> None:
-        if hotkey_text == self.hotkey_text:
+    def restart_hotkeys(self, capture_text: str, copy_text: str) -> None:
+        new_texts = {"capture": capture_text.strip(), "copy": copy_text.strip()}
+        if new_texts == self.hotkey_texts:
             return
+        self.hotkey_texts = new_texts
         if self._kbd_listener is not None:
             self._kbd_listener.stop()
             self._kbd_listener = None
-        self._start_keyboard(hotkey_text)
+        self._start_keyboard()
 
     def _start_mouse(self) -> None:
         def on_click(x, y, _button, pressed) -> None:
@@ -1664,14 +1712,15 @@ def hotkey_to_qt_key(text: str) -> int:
     return combined
 
 
-def kglobalaccel_set_shortcut(keys: list[int], flags: int) -> None:
+def kglobalaccel_set_shortcut(action: str, keys: list[int], flags: int) -> None:
     """Set a KGlobalAccel binding.
 
     PySide6 cannot marshal the unsigned-int flags argument of
     KGlobalAccel.setShortcut, so gdbus (which coerces types using the service
     introspection data) or dbus-send is used for this single call.
     """
-    action = json.dumps(list(KGA_CAPTURE_ACTION_ID), ensure_ascii=False)
+    action_id = kglobalaccel_action_id(action)
+    action_arg = json.dumps(action_id, ensure_ascii=False)
     key_array = "[" + ",".join(str(int(key)) for key in keys) + "]"
     gdbus = shutil.which("gdbus")
     if gdbus:
@@ -1681,7 +1730,7 @@ def kglobalaccel_set_shortcut(keys: list[int], flags: int) -> None:
                 "--dest", KGA_SERVICE,
                 "--object-path", KGA_PATH,
                 "--method", f"{KGA_IFACE}.setShortcut",
-                action, key_array, str(int(flags)),
+                action_arg, key_array, str(int(flags)),
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1694,7 +1743,7 @@ def kglobalaccel_set_shortcut(keys: list[int], flags: int) -> None:
 
     dbus_send = shutil.which("dbus-send")
     if dbus_send:
-        action_arg = "array:string:" + ",".join(f'"{value}"' for value in KGA_CAPTURE_ACTION_ID)
+        action_arg = "array:string:" + ",".join(f'"{value}"' for value in action_id)
         keys_arg = "array:int32:" + ",".join(str(int(key)) for key in keys)
         proc = subprocess.run(
             [
@@ -1714,9 +1763,10 @@ def kglobalaccel_set_shortcut(keys: list[int], flags: int) -> None:
     raise RuntimeError("需要 gdbus 或 dbus-send 来设置 KDE 全局快捷键")
 
 
-def kglobalaccel_get_shortcut() -> list[int]:
-    """Read the current KGlobalAccel binding for the capture action."""
-    action = json.dumps(list(KGA_CAPTURE_ACTION_ID), ensure_ascii=False)
+def kglobalaccel_get_shortcut(action: str) -> list[int]:
+    """Read the current KGlobalAccel binding for the given action."""
+    action_id = kglobalaccel_action_id(action)
+    action_arg = json.dumps(action_id, ensure_ascii=False)
     gdbus = shutil.which("gdbus")
     if gdbus:
         proc = subprocess.run(
@@ -1725,7 +1775,7 @@ def kglobalaccel_get_shortcut() -> list[int]:
                 "--dest", KGA_SERVICE,
                 "--object-path", KGA_PATH,
                 "--method", f"{KGA_IFACE}.shortcut",
-                action,
+                action_arg,
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1733,16 +1783,16 @@ def kglobalaccel_get_shortcut() -> list[int]:
         )
         if proc.returncode == 0:
             payload = proc.stdout.decode("utf-8", "replace").strip().strip("()").rstrip(",")
-            payload = payload.strip("[]")
-            return [int(part) for part in payload.split(",") if part.strip()]
+            payload = payload.removeprefix("@ai").strip().strip("[]")
+            return [int(part) for part in payload.replace(" ", "").split(",") if part]
 
     dbus_send = shutil.which("dbus-send")
     if dbus_send:
-        action_arg = "array:string:" + ",".join(f'"{value}"' for value in KGA_CAPTURE_ACTION_ID)
+        dbus_action_arg = "array:string:" + ",".join(f'"{value}"' for value in action_id)
         proc = subprocess.run(
             [
                 dbus_send, "--session", "--print-reply", f"--dest={KGA_SERVICE}", KGA_PATH,
-                f"{KGA_IFACE}.shortcut", action_arg,
+                f"{KGA_IFACE}.shortcut", dbus_action_arg,
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1767,18 +1817,20 @@ class WaylandInputService(QObject):
     """
 
     hotkey_pressed = Signal()
+    copy_hotkey_pressed = Signal()
     mouse_pressed = Signal(int, int)  # global mouse monitoring is unavailable
 
-    def __init__(self, hotkey_text: str) -> None:
+    def __init__(self, capture_text: str, copy_text: str) -> None:
         super().__init__()
         if QDBusConnection is None or QDBusMessage is None:
             raise RuntimeError(f"QtDBus 不可用: {QDBUS_IMPORT_ERROR}")
         self.bus = QDBusConnection.sessionBus()
         if not self.bus.isConnected():
             raise RuntimeError("无法连接会话 D-Bus")
-        self.hotkey_text = hotkey_text
-        self._key = hotkey_to_qt_key(hotkey_text)
-        self._register()
+        self.hotkey_texts = {"capture": capture_text.strip(), "copy": copy_text.strip()}
+        self._keys: dict[str, int] = {}
+        for action in KGA_ACTIONS:
+            self._register_action(action)
         ok = self.bus.connect(
             KGA_SERVICE,
             KGA_COMPONENT_PATH,
@@ -1789,7 +1841,11 @@ class WaylandInputService(QObject):
         )
         if not ok:
             raise RuntimeError("无法订阅 KGlobalAccel globalShortcutPressed 信号")
-        LOG.info("global hotkey=%s backend=kglobalaccel key=%#x", hotkey_text, self._key)
+        LOG.info(
+            "global hotkeys backend=kglobalaccel capture=%s copy=%s",
+            self.hotkey_texts["capture"] or "off",
+            self.hotkey_texts["copy"] or "off",
+        )
 
     def _call(self, path: str, interface: str, method: str, args: list[Any]) -> list[Any]:
         message = QDBusMessage.createMethodCall(KGA_SERVICE, path, interface, method)
@@ -1799,54 +1855,70 @@ class WaylandInputService(QObject):
             raise RuntimeError(f"KGlobalAccel {method} 失败: {reply.errorName()}: {reply.errorMessage()}")
         return list(reply.arguments())
 
-    def _current_keys(self) -> list[int]:
-        return kglobalaccel_get_shortcut()
-
-    def _register(self) -> None:
-        self._call(KGA_PATH, KGA_IFACE, "doRegister", [list(KGA_CAPTURE_ACTION_ID)])
-        keys = self._current_keys()
-        key = int(keys[0]) if keys else int(self._key)
+    def _register_action(self, action: str) -> None:
+        self._call(KGA_PATH, KGA_IFACE, "doRegister", [kglobalaccel_action_id(action)])
+        text = self.hotkey_texts.get(action, "")
+        if not text:
+            self._set_inactive(action)
+            return
+        keys = kglobalaccel_get_shortcut(action)
+        key = int(keys[0]) if keys else hotkey_to_qt_key(text)
         # Re-assert the binding with SetPresent so the daemon grabs the key in
         # this session while keeping any binding customized in System Settings.
-        self._set_key(key)
+        self._set_key(action, key)
         if keys:
-            LOG.info("kglobalaccel kept existing shortcut key=%#x", self._key)
+            LOG.info("kglobalaccel kept existing %s key=%#x", action, key)
 
-    def _set_key(self, key: int) -> None:
-        kglobalaccel_set_shortcut([int(key)], KGA_SET_FLAGS)
-        keys = self._current_keys()
-        if int(key) not in [int(value) for value in keys]:
-            raise RuntimeError("KGlobalAccel 未接受快捷键；可能与其他全局快捷键冲突")
-        self._key = int(key)
+    def _set_inactive(self, action: str) -> None:
+        try:
+            self._call(KGA_PATH, KGA_IFACE, "setInactive", [kglobalaccel_action_id(action)])
+        except Exception:
+            LOG.debug("kglobalaccel setInactive failed action=%s", action, exc_info=True)
+        self._keys.pop(action, None)
+
+    def _set_key(self, action: str, key: int) -> None:
+        kglobalaccel_set_shortcut(action, [int(key)], KGA_SET_FLAGS)
+        if int(key) not in [int(value) for value in kglobalaccel_get_shortcut(action)]:
+            raise RuntimeError(f"KGlobalAccel 未接受 {action} 快捷键；可能与其他全局快捷键冲突")
+        self._keys[action] = int(key)
 
     @Slot(str, str, "qlonglong")
     def on_pressed(self, component: str, shortcut: str, _timestamp: int) -> None:
-        if component == KGA_COMPONENT and shortcut == KGA_ACTION:
-            self.hotkey_pressed.emit()
-
-    def restart_hotkey(self, hotkey_text: str) -> None:
-        if hotkey_text == self.hotkey_text:
+        if component != KGA_COMPONENT:
             return
-        self._set_key(hotkey_to_qt_key(hotkey_text))
-        self.hotkey_text = hotkey_text
-        LOG.info("kglobalaccel shortcut updated key=%#x", self._key)
+        if shortcut == "capture":
+            self.hotkey_pressed.emit()
+        elif shortcut == "copy":
+            self.copy_hotkey_pressed.emit()
+
+    def restart_hotkeys(self, capture_text: str, copy_text: str) -> None:
+        new_texts = {"capture": capture_text.strip(), "copy": copy_text.strip()}
+        for action, text in new_texts.items():
+            if text == self.hotkey_texts.get(action, ""):
+                continue
+            self.hotkey_texts[action] = text
+            if not text:
+                self._set_inactive(action)
+                LOG.info("kglobalaccel %s shortcut disabled", action)
+                continue
+            self._set_key(action, hotkey_to_qt_key(text))
+            LOG.info("kglobalaccel %s shortcut updated key=%#x", action, self._keys[action])
 
     def stop(self) -> None:
-        try:
-            self._call(KGA_PATH, KGA_IFACE, "setInactive", [list(KGA_CAPTURE_ACTION_ID)])
-        except Exception:
-            LOG.debug("kglobalaccel setInactive failed", exc_info=True)
+        for action in KGA_ACTIONS:
+            self._set_inactive(action)
 
 
 def create_input_service(cfg: dict[str, Any]) -> QObject:
-    hotkey = str(cfg["app"]["hotkey"])
+    capture = str(cfg["app"]["hotkey"])
+    copy_hotkey = str(cfg["app"].get("copy_hotkey", ""))
     mode = str(cfg["app"].get("input_backend", "auto")).strip().lower()
     if mode == "auto":
         mode = "kglobalaccel" if IS_WAYLAND else "pynput"
     if mode == "kglobalaccel":
-        return WaylandInputService(hotkey)
+        return WaylandInputService(capture, copy_hotkey)
     if mode == "pynput":
-        return InputService(hotkey)
+        return InputService(capture, copy_hotkey)
     raise RuntimeError(f"不支持的输入后端: {mode}")
 
 
@@ -1857,6 +1929,7 @@ class Controller(QObject):
         self.cfg = load_config()
         self.input = create_input_service(self.cfg)
         self.input.hotkey_pressed.connect(self.trigger)
+        self.input.copy_hotkey_pressed.connect(self.trigger_copy)
         self.input.mouse_pressed.connect(self.global_mouse_press)
         if IS_WAYLAND and bool(self.cfg["app"].get("close_on_outside_click", True)):
             LOG.info("Wayland: 点击贴图外部关闭不可用；请使用 × 或重新触发快捷键")
@@ -1866,6 +1939,7 @@ class Controller(QObject):
         self.worker: PipelineWorker | None = None
         self.pending_rect: QRect | None = None
         self.pending_image: QImage | None = None
+        self.pending_mode = "translate"
         self.busy = False
         self.tray: QSystemTrayIcon | None = None
         self.tray_menu: QMenu | None = None
@@ -1889,10 +1963,12 @@ class Controller(QObject):
         icon = make_tray_icon()
         self.app.setWindowIcon(icon)
         self.tray = QSystemTrayIcon(icon, self.app)
-        self.tray.setToolTip(f"{APP_NAME} {VERSION} · {self.cfg['app']['hotkey']}")
+        self.tray.setToolTip(TRAY_TOOLTIP)
         self.tray_menu = QMenu()
         capture_action = self.tray_menu.addAction("截图并翻译")
         capture_action.triggered.connect(self.trigger)
+        copy_action = self.tray_menu.addAction("截图并复制原文")
+        copy_action.triggered.connect(self.trigger_copy)
         config_action = self.tray_menu.addAction("打开配置文件")
         config_action.triggered.connect(
             lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(CONFIG_PATH)))
@@ -1924,7 +2000,7 @@ class Controller(QObject):
         elif not wanted and self.tray is not None:
             self._teardown_tray()
         elif self.tray is not None:
-            self.tray.setToolTip(f"{APP_NAME} {VERSION} · {self.cfg['app']['hotkey']}")
+            self.tray.setToolTip(TRAY_TOOLTIP)
 
     def _tray_activated(self, reason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
@@ -1933,7 +2009,10 @@ class Controller(QObject):
     def config_changed(self, _path: str) -> None:
         try:
             new_cfg = load_config()
-            self.input.restart_hotkey(str(new_cfg["app"]["hotkey"]))
+            self.input.restart_hotkeys(
+                str(new_cfg["app"]["hotkey"]),
+                str(new_cfg["app"].get("copy_hotkey", "")),
+            )
             self.cfg = new_cfg
             self._apply_tray_config()
             reload_log_level(self.cfg)
@@ -1948,14 +2027,24 @@ class Controller(QObject):
             self.watcher.addPath(str(CONFIG_PATH))
 
     def trigger(self) -> None:
+        self._start_selection("translate")
+
+    def trigger_copy(self) -> None:
+        self._start_selection("copy")
+
+    def _start_selection(self, mode: str) -> None:
         if self.busy or self.selector is not None:
             return
         try:
             self.cfg = load_config()
             reload_log_level(self.cfg)
+            if mode == "copy" and not str(self.cfg["app"].get("copy_hotkey", "")).strip():
+                notify(APP_NAME, "未配置“截图并复制原文”快捷键")
+                return
             if self.overlay is not None:
                 self.overlay.close()
                 self.overlay = None
+            self.pending_mode = mode
             self.selector = Selector(self.cfg)
             self.selector.selected.connect(self.selection_done)
             self.selector.cancelled.connect(self.selection_cancelled)
@@ -1989,7 +2078,7 @@ class Controller(QObject):
 
         backend = str(self.cfg["translation"]["backend"]).strip().lower()
         keys: dict[str, Any] = {}
-        if backend in {"google_cloud", "google-cloud", "cloud_google"}:
+        if self.pending_mode == "translate" and backend in {"google_cloud", "google-cloud", "cloud_google"}:
             try:
                 keys = load_keys()
             except Exception as exc:
@@ -2001,8 +2090,24 @@ class Controller(QObject):
                 notify("密钥配置失败", str(exc))
                 return
 
-        LOG.info("capture width=%d height=%d x=%d y=%d", rect.width(), rect.height(), rect.x(), rect.y())
-        self.worker = PipelineWorker(png, self.cfg, keys)
+        parser_override = None
+        if self.pending_mode == "copy":
+            parser_override = str(self.cfg["ocr"].get("copy_parser", "")).strip() or None
+        LOG.info(
+            "capture width=%d height=%d x=%d y=%d mode=%s",
+            rect.width(),
+            rect.height(),
+            rect.x(),
+            rect.y(),
+            self.pending_mode,
+        )
+        self.worker = PipelineWorker(
+            png,
+            self.cfg,
+            keys,
+            translate=self.pending_mode == "translate",
+            parser_override=parser_override,
+        )
         self.worker.done.connect(self.pipeline_done)
         self.worker.failed.connect(self.pipeline_failed)
         self.worker.finished.connect(self.worker.deleteLater)
@@ -2010,6 +2115,16 @@ class Controller(QObject):
 
     def pipeline_done(self, result: dict[str, Any]) -> None:
         try:
+            if self.pending_mode == "copy":
+                text = str(result.get("source_text", ""))
+                QGuiApplication.clipboard().setText(text)
+                notify("已复制原文", f"{len(text)} 个字符")
+                LOG.info(
+                    "ocr copy done chars=%d elapsed=%.3fs",
+                    len(text),
+                    float(result.get("elapsed", 0.0)),
+                )
+                return
             if self.pending_image is None or self.pending_rect is None:
                 raise RuntimeError("内部状态丢失")
             scale = 1.0
@@ -2050,7 +2165,8 @@ class Controller(QObject):
         self.pending_image = None
         self.pending_rect = None
         self.worker = None
-        notify("截图翻译失败", message)
+        title = "原文复制失败" if self.pending_mode == "copy" else "截图翻译失败"
+        notify(title, message)
 
     def overlay_closed(self) -> None:
         self.overlay = None

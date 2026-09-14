@@ -7,6 +7,8 @@
 # X11：由 pynput 监听。
 # KDE Wayland：注册到 KGlobalAccel，也可以稍后在“系统设置 → 快捷键”中修改。
 hotkey = "ctrl+alt+d"
+# 第二个快捷键：只调用 Umi-OCR 识别并自动把原文复制到剪贴板（不翻译）。留空禁用。
+copy_hotkey = "super+ctrl+shift+o"
 # auto / pynput / kglobalaccel
 # auto：X11 用 pynput，Wayland 用 KGlobalAccel。
 input_backend = "auto"
@@ -36,7 +38,13 @@ startup_timeout_s = 8.0
 request_timeout_s = 20.0
 # 中文模型同时能识别常见英文，适合默认自动识别源语言。
 language = "models/config_chinese.txt"
+# 排版解析方案（Umi-OCR tbpu.parser）：
+# multi_para(多栏-自然段) / multi_line(多栏-总是换行) / multi_none(多栏-无换行)
+# single_para(单栏-自然段) / single_line(单栏-总是换行) / single_none(单栏-无换行)
+# single_code(单栏-保留缩进) / none(不做处理)
 parser = "multi_para"
+# 只识别不翻译时单独使用的解析方案；留空则沿用 parser。
+copy_parser = ""
 limit_side_len = 2880
 
 [translation]
