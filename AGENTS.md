@@ -10,6 +10,8 @@ Screenshot Translator 是面向 Linux + KDE Plasma 的无主窗口截图翻译�
 
 ```text
 Ctrl+Alt+D → 全屏选择层拖选 → Umi-OCR → 翻译 → 在原屏幕位置显示贴片
+Super+Ctrl+Shift+O（app.copy_hotkey，可留空禁用）→ 同样框选 → 只 OCR
+  → 原文自动复制到剪贴板 + 通知（不翻译、不显示贴图）
 ```
 
 X11 使用 Qt 直接抓屏和 pynput 全局输入；KDE Wayland 使用 Spectacle 全屏抓取、KGlobalAccel 全局快捷键和全屏透明画布贴图。核心流程已在两边验证；Wayland 的点击外部关闭、键盘焦点、多屏和混合缩放有平台限制，不得夸大为已完成。
@@ -111,9 +113,9 @@ AGENTS.md              本文件，唯一的 Agent 说明
 
 1. 探测 Umi-OCR HTTP 服务。
 2. 服务不可用且 `ocr.auto_start=true` 时运行 `umi-ocr.sh --hide` 并等待就绪。
-3. 以 base64 PNG 调用 `/api/ocr`，请求 `data.format = dict`。
+3. 以 base64 PNG 调用 `/api/ocr`，请求 `data.format = dict`；排版方案取 `ocr.parser`（`translate=False` 时可用 `ocr.copy_parser` 覆盖）。
 4. 使用返回项的 `text`、`box`、`end` 组织源文本和段落。
-5. 按段落调用可插拔翻译后端。
+5. `translate=True` 时按段落调用可插拔翻译后端；`translate=False` 时只发出 `source_text`（`paragraphs` 为空），供复制模式使用。
 6. 发出源文、译文、段落边界框和耗时。
 
 支持的 backend：
@@ -158,14 +160,14 @@ X11 下 `OverlayWindow` 通过全局矩形定位贴图。Wayland 不允许客户
 
 ### 全局输入和控制器
 
-`create_input_service()` 按会话选择输入后端：
+`create_input_service()` 按会话选择输入后端，并同时注册两个动作（`KGA_ACTIONS`）：`capture`（翻译，`app.hotkey`）和 `copy`（只识别，`app.copy_hotkey`，留空禁用）。
 
-- `pynput`（X11）：`InputService` 监听全局快捷键和鼠标按下事件，`close_on_outside_click` 依赖它。
-- `kglobalaccel`（KDE Wayland）：`WaylandInputService` 通过 KGlobalAccel D-Bus 注册快捷键并订阅 `globalShortcutPressed`。PySide6 无法序列化 `setShortcut` 的 `u` flags，因此设置快捷键通过 `gdbus`（优先）或 `dbus-send` 子进程完成；doRegister、setInactive 和信号订阅仍走 QtDBus。Wayland 没有全局鼠标监听，`mouse_pressed` 不会触发。
+- `pynput`（X11）：`InputService` 监听两个全局快捷键和鼠标按下事件，`close_on_outside_click` 依赖它。
+- `kglobalaccel`（KDE Wayland）：`WaylandInputService` 通过 KGlobalAccel D-Bus 注册两个动作并订阅 `globalShortcutPressed`，按 `shortcut` 名分派到 `hotkey_pressed` / `copy_hotkey_pressed`。PySide6 无法序列化 `setShortcut` 的 `u` flags，因此设置快捷键通过 `gdbus`（优先）或 `dbus-send` 子进程完成；doRegister、setInactive 和信号订阅仍走 QtDBus。Wayland 没有全局鼠标监听，`mouse_pressed` 不会触发。
 
-默认快捷键 `ctrl+alt+d` 必须可配置。Wayland 下 KGlobalAccel 中已有的绑定优先保留（用户可在 System Settings 修改），配置文件中的 `hotkey` 在首次注册或配置变更时应用。
+快捷键 `ctrl+alt+d` / `super+ctrl+shift+o` 必须可配置。Wayland 下 KGlobalAccel 中已有的绑定优先保留（用户可在 System Settings 修改），配置文件中的快捷键在首次注册或配置变更时应用；留空表示把该动作标记为 inactive。
 
-`Controller` 负责配置热加载、快捷键重注册、选择层、后台流水线、贴图生命周期、系统托盘图标（`app.tray_icon` 热切换）和点击外部关闭逻辑。托盘用 `QSystemTrayIcon`（KDE 下为 StatusNotifierItem），菜单为截图、打开配置、打开日志、退出；左键单击等同触发截图。
+`Controller` 负责配置热加载、快捷键重注册、选择层、后台流水线、贴图生命周期、系统托盘图标（`app.tray_icon` 热切换）和点击外部关闭逻辑。托盘用 `QSystemTrayIcon`（KDE 下为 StatusNotifierItem），菜单为截图、截图并复制原文、打开配置、打开日志、退出；左键单击等同触发截图。`_start_selection(mode)` 以 `pending_mode`（`translate` / `copy`）区分两条流水线；`copy` 模式完成后写入剪贴板并通知，不创建 `OverlayWindow`。
 
 ## 安装、检查和运行
 
@@ -204,8 +206,9 @@ target = "zh-CN"
 5. 拖选区域的显示像素、全局边界和 OCR 输入一致（Wayland 注意逻辑坐标×缩放 = 物理像素）。
 6. 使用 `identity` 验证原位贴图（Wayland 贴图应出现在选区原位置）。
 7. 验证原/译切换、复制原文、复制译文、`×`、右键关闭、中键归位、滚轮缩放、左键拖动、再次截图替换；Wayland 的 `Esc`/点击外部限制见上。
-8. 验证 OCR/翻译失败只通知和写日志。
-9. 最后单独测试 Google 或 LibreTranslate。
+8. 按 `Super+Ctrl+Shift+O`（`app.copy_hotkey`）框选：应只 OCR、不翻译，原文进入剪贴板并弹通知；`app.copy_hotkey` 留空时该动作不注册。
+9. 验证 OCR/翻译失败只通知和写日志。
+10. 最后单独测试 Google 或 LibreTranslate。
 
 在完整实测前不要声称全部功能可用。混合 DPI、多屏和 GNOME/wlroots 等非 KDE Wayland 尚未专门验证。
 

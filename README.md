@@ -8,9 +8,10 @@
 
 `Ctrl+Alt+D` → 框选区域 → Umi-OCR → 自动识别源语言 → 翻译为 `zh-CN` → 在原截图位置显示翻译贴图。
 
-## V0.2.0 交互
+## 交互
 
-- 默认快捷键：`Ctrl+Alt+D`。
+- 默认快捷键：`Ctrl+Alt+D`（截图翻译）。
+- 第二个快捷键：`Super+Ctrl+Shift+O`（`app.copy_hotkey`，可改可留空禁用）——只调用 Umi-OCR 识别，不翻译，识别出的原文自动复制到剪贴板并弹通知。
 - 框选完成后，选区中心显示转圈指示，OCR/翻译完成或失败后自动消失。
 - 贴图默认显示译图，原截图中的非文字区域保留。
 - OCR 文字区域使用半透明遮罩并绘制译文。
@@ -148,10 +149,15 @@ KDE Wayland 会话的检查应显示 `会话: OK (wayland KDE)`、`截图后端:
 ```toml
 [app]
 hotkey = "ctrl+alt+d"
-input_backend = "auto"   # auto / pynput / kglobalaccel
+copy_hotkey = "super+ctrl+shift+o"  # 只识别并复制原文；留空禁用
+input_backend = "auto"             # auto / pynput / kglobalaccel
 
 [capture]
-backend = "auto"         # auto / qt_x11 / spectacle
+backend = "auto"                   # auto / qt_x11 / spectacle
+
+[ocr]
+parser = "multi_para"              # multi_para / multi_line / single_para / single_line / none
+copy_parser = ""                   # 只识别模式单独指定；留空沿用 parser
 
 [translation]
 backend = "google"
