@@ -11,6 +11,8 @@
 #            home、end、pageup、pagedown、up、down、left、right
 #   分隔符： +、- 或空格均可，大小写不敏感
 #   无修饰键时只允许 F13-F24（例如 "f13"），避免抢占正常输入
+#           注意：系统默认把 F13-F24 映射成 XF86 多媒体键，需要先启用
+#           fkeys:basic_13-24（KDE Wayland 下注销重登），详见 README / 使用说明
 #   平台差异： KDE Wayland 全部支持；X11/pynput 的功能键最高 F20
 #   写入方式： KDE Wayland 会注册到 KGlobalAccel，以本配置为准
 #
