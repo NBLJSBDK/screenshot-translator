@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Screenshot Translator v0.1.2
+"""Screenshot Translator v0.2.0
 
 KDE Plasma / Linux screenshot translation overlay (X11 and Wayland).
 
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -84,7 +85,7 @@ from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QPushButton, QW
 
 APP_NAME = "Screenshot Translator"
 APP_SLUG = "screenshot-translator"
-VERSION = "0.1.2"
+VERSION = "0.2.0"
 BASE_DIR = Path(__file__).resolve().parent
 
 SESSION_TYPE = os.environ.get("XDG_SESSION_TYPE", "").lower()
@@ -121,7 +122,7 @@ DEFAULTS: dict[str, Any] = {
     "app": {
         "hotkey": "ctrl+alt+d",
         "input_backend": "auto",
-        "drag_hold_ms": 350,
+        "drag_hold_ms": 0,
         "close_on_outside_click": True,
     },
     "capture": {
@@ -271,6 +272,51 @@ def notify(title: str, message: str) -> None:
         LOG.exception("system notification failed")
 
 
+_LOCK_FILE: Any = None
+
+
+def acquire_single_instance() -> bool:
+    """Prevent two resident instances from fighting over the same hotkey."""
+    global _LOCK_FILE
+    ensure_runtime_dirs()
+    lock_path = STATE_DIR / "app.lock"
+    try:
+        _LOCK_FILE = lock_path.open("a+")
+        fcntl.flock(_LOCK_FILE, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        if _LOCK_FILE is not None:
+            _LOCK_FILE.close()
+            _LOCK_FILE = None
+        return False
+    _LOCK_FILE.seek(0)
+    _LOCK_FILE.truncate()
+    _LOCK_FILE.write(str(os.getpid()))
+    _LOCK_FILE.flush()
+    return True
+
+
+def quit_running_instance() -> int:
+    lock_path = STATE_DIR / "app.lock"
+    if not lock_path.exists():
+        print("没有运行中的实例。")
+        return 0
+    try:
+        pid = int(lock_path.read_text().strip())
+    except Exception:
+        print(f"无法从 {lock_path} 读取 PID；可用 `pgrep -af app.py` 手动结束。")
+        return 1
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        print("实例已退出。")
+        return 0
+    except PermissionError:
+        print(f"没有权限结束 PID {pid}。")
+        return 1
+    print(f"已请求退出实例 PID {pid}。")
+    return 0
+
+
 def image_to_png_bytes(image: QImage) -> bytes:
     data = QByteArray()
     buf = QBuffer(data)
@@ -321,8 +367,8 @@ def capture_virtual_desktop() -> CaptureResult:
                 geo.height(),
             )
             source_image = pixmap.toImage()
-            # v0.1.2 targets normal X11 scaling. Scale to logical screen geometry
-            # if Qt returned device-pixel-sized content.
+            # Scale to logical screen geometry if Qt returned device-pixel-sized
+            # content.
             painter.drawImage(target, source_image)
     finally:
         painter.end()
@@ -355,16 +401,30 @@ def capture_desktop_spectacle() -> CaptureResult:
     ensure_runtime_dirs()
     _cleanup_old_captures()
     target = CACHE_DIR / f"wayland-capture-{os.getpid()}-{time.monotonic_ns()}.png"
+    # -i forces a fresh instance: without it, an already running Spectacle GUI
+    # swallows the background request, exits 0 and never writes the file.
+    args = [exe, "-b", "-n", "-i", "-f", "-o", str(target)]
     try:
-        proc = subprocess.run(
-            [exe, "-b", "-n", "-f", "-o", str(target)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            timeout=45,
-        )
-        if proc.returncode != 0 or not target.exists():
+        detail = ""
+        for attempt in range(2):
+            proc = subprocess.run(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=45,
+            )
             detail = proc.stderr.decode("utf-8", "replace").strip()
-            raise RuntimeError(f"Spectacle 截图失败(code={proc.returncode}): {detail or '未生成文件'}")
+            if proc.returncode != 0:
+                detail = detail or f"spectacle 退出码 {proc.returncode}"
+                continue
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not target.exists():
+                time.sleep(0.05)
+            if target.exists() and target.stat().st_size > 0:
+                break
+            detail = "未生成文件"
+        else:
+            raise RuntimeError(f"Spectacle 截图失败: {detail or '未生成文件'}")
         data = target.read_bytes()
         image = QImage.fromData(data, "PNG")
         if image.isNull() or image.width() == 0 or image.height() == 0:
@@ -1070,6 +1130,14 @@ class DraggableImage(QLabel):
         self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.RightButton:
+            self.overlay.close()
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self.overlay.reset_position()
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             self.press_global = event.globalPosition().toPoint()
             if self.overlay.canvas_mode:
@@ -1078,6 +1146,14 @@ class DraggableImage(QLabel):
                 self.window_start = self.overlay.pos()
             self.timer.start()
         super().mousePressEvent(event)
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y()
+        if delta:
+            self.overlay.zoom_at(delta / 120.0, event.globalPosition().toPoint())
+            event.accept()
+            return
+        super().wheelEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if (
@@ -1122,6 +1198,9 @@ class OverlayWindow(QWidget):
         self.cfg = cfg
         self.drag_hold_ms = int(cfg["app"]["drag_hold_ms"])
         self.showing_translation = True
+        self.current_image = self.translated
+        self.zoom = 1.0
+        self.base_rect = QRect(global_rect)
         self.canvas_mode = IS_WAYLAND
         self.logical_size = global_rect.size()
         self.canvas_origin = QPoint(0, 0)
@@ -1152,7 +1231,6 @@ class OverlayWindow(QWidget):
             self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self.image = DraggableImage(self)
-        self.image.setPixmap(self._display_pixmap(self.translated))
         self.image.setScaledContents(False)
 
         self.toolbar = QWidget(self)
@@ -1193,18 +1271,54 @@ class OverlayWindow(QWidget):
         )
         return btn
 
-    def _display_pixmap(self, image: QImage) -> QPixmap:
-        # Keep the physical-pixel image and declare its device pixel ratio so
-        # Qt maps it 1:1 onto the fractional-scaled surface. Pre-scaling to the
-        # logical size would resample the image twice and blur it.
-        pixmap = QPixmap.fromImage(image)
-        logical = self.logical_size
-        if logical.width() > 0 and logical.height() > 0:
-            ratio_x = image.width() / logical.width()
-            ratio_y = image.height() / logical.height()
-            if ratio_x > 0 and ratio_y > 0:
-                pixmap.setDevicePixelRatio((ratio_x + ratio_y) / 2)
+    def _pixmap_for_target(self, image: QImage, target: QSize) -> QPixmap:
+        if target.width() <= 0 or target.height() <= 0:
+            return QPixmap.fromImage(image)
+        dpr = self.devicePixelRatioF() or 1.0
+        phys = QSize(
+            max(1, round(target.width() * dpr)),
+            max(1, round(target.height() * dpr)),
+        )
+        if abs(phys.width() - image.width()) <= 1 and abs(phys.height() - image.height()) <= 1:
+            # Near-native zoom: keep the physical pixels and map them 1:1 so the
+            # overlay stays sharp instead of being resampled twice.
+            pixmap = QPixmap.fromImage(image)
+            ratio = (image.width() / target.width() + image.height() / target.height()) / 2
+            pixmap.setDevicePixelRatio(ratio)
+            return pixmap
+        scaled = image.scaled(
+            phys,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        pixmap = QPixmap.fromImage(scaled)
+        pixmap.setDevicePixelRatio(dpr)
         return pixmap
+
+    def _refresh_pixmap(self) -> None:
+        self.image.setPixmap(self._pixmap_for_target(self.current_image, self.image.size()))
+
+    def image_rect_global(self) -> QRect:
+        origin = self.canvas_origin if self.canvas_mode else self.mapToGlobal(QPoint(0, 0))
+        return self.image.geometry().translated(origin)
+
+    def reset_position(self) -> None:
+        self.zoom = 1.0
+        self._place(QRect(self.base_rect))
+
+    def zoom_at(self, steps: float, anchor: QPoint) -> None:
+        new_zoom = min(4.0, max(0.25, self.zoom * (1.15 ** steps)))
+        if abs(new_zoom - self.zoom) < 1e-6:
+            return
+        current = self.image_rect_global()
+        rel_x = (anchor.x() - current.x()) / max(1, current.width())
+        rel_y = (anchor.y() - current.y()) / max(1, current.height())
+        new_w = max(1, round(self.base_rect.width() * new_zoom))
+        new_h = max(1, round(self.base_rect.height() * new_zoom))
+        new_x = round(anchor.x() - rel_x * new_w)
+        new_y = round(anchor.y() - rel_y * new_h)
+        self.zoom = new_zoom
+        self._place(QRect(new_x, new_y, new_w, new_h))
 
     def _update_mask(self) -> None:
         if not self.canvas_mode:
@@ -1256,6 +1370,7 @@ class OverlayWindow(QWidget):
             self.image.setGeometry(image_global.translated(-self.canvas_origin))
             self.toolbar.setGeometry(toolbar_global.translated(-self.canvas_origin))
             self.toolbar.raise_()
+            self._refresh_pixmap()
             self._update_mask()
             return
 
@@ -1264,6 +1379,7 @@ class OverlayWindow(QWidget):
         self.image.setGeometry(image_global.translated(-union.topLeft()))
         self.toolbar.setGeometry(toolbar_global.translated(-union.topLeft()))
         self.toolbar.raise_()
+        self._refresh_pixmap()
 
     def show_overlay(self) -> None:
         if self.canvas_mode:
@@ -1277,8 +1393,8 @@ class OverlayWindow(QWidget):
 
     def toggle_view(self) -> None:
         self.showing_translation = not self.showing_translation
-        image = self.translated if self.showing_translation else self.original
-        self.image.setPixmap(self._display_pixmap(image))
+        self.current_image = self.translated if self.showing_translation else self.original
+        self._refresh_pixmap()
 
     def copy_source(self) -> None:
         QGuiApplication.clipboard().setText(self.source_text)
@@ -1972,6 +2088,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--config-path", action="store_true", help="只打印配置文件路径")
     parser.add_argument("--keys-path", action="store_true", help="只打印密钥配置文件路径")
     parser.add_argument("--log-path", action="store_true", help="只打印日志文件路径")
+    parser.add_argument("--quit", action="store_true", help="停止正在运行的常驻实例")
     parser.add_argument("--version", action="store_true", help="打印版本")
     return parser.parse_args(argv)
 
@@ -1990,10 +2107,17 @@ def main() -> int:
     if args.log_path:
         print(LOG_PATH)
         return 0
+    if args.quit:
+        return quit_running_instance()
 
     if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
         print("没有图形会话；需要在 KDE/X11 或 KDE/Wayland 中运行。", file=sys.stderr)
         return 2
+
+    if not args.check and not acquire_single_instance():
+        print(f"{APP_NAME} 已在运行。", file=sys.stderr)
+        notify(APP_NAME, "程序已在运行，未重复启动")
+        return 0
 
     app = QApplication(sys.argv[:1])
     app.setApplicationName(APP_NAME)

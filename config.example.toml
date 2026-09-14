@@ -1,4 +1,4 @@
-# Screenshot Translator v0.1.2
+# Screenshot Translator v0.2.0
 # 实际配置：~/.config/screenshot-translator/config.toml
 # 修改后会自动重新加载；下一次截图使用新配置。
 
@@ -10,8 +10,8 @@ hotkey = "ctrl+alt+d"
 # auto / pynput / kglobalaccel
 # auto：X11 用 pynput，Wayland 用 KGlobalAccel。
 input_backend = "auto"
-# 在贴图图像区域按住左键超过这个时间后，拖动即可移动整个贴图。
-drag_hold_ms = 350
+# 在贴图图像区域按住左键即可拖动；0 表示立即拖动，大于 0 表示需长按相应毫秒。
+drag_hold_ms = 0
 # 点击贴图和控制按钮以外的位置时关闭贴图。
 # 仅 X11 有效；Wayland 不允许全局鼠标监听，请用 × 或再次触发快捷键。
 close_on_outside_click = true
