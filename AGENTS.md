@@ -4,7 +4,7 @@
 
 ## 项目目标
 
-Screenshot Translator 是面向 Linux + KDE Plasma 的无主窗口截图翻译贴片工具，支持 X11 和 KDE Plasma Wayland 会话。它不提供普通主窗口、托盘设置界面或完整截图管理器。
+Screenshot Translator 是面向 Linux + KDE Plasma 的无主窗口截图翻译贴片工具，支持 X11 和 KDE Plasma Wayland 会话。它提供系统托盘图标（运行状态、截图、打开配置/日志、退出），但不提供普通主窗口、设置界面或完整截图管理器。
 
 默认流程：
 
@@ -56,6 +56,8 @@ HTTP API：`http://127.0.0.1:1224/api/ocr`。
 app.py                 主程序：选择器、OCR/翻译、贴图、输入监听
 config.example.toml    默认配置模板
 keys.example.toml      Google Cloud API Key 配置模板，不含真实密钥
+assets/app-icon.svg    托盘图标源文件（Font Awesome Free 5.15.4 `globe`，CC BY 4.0；运行时按配色染白）
+assets/LICENSE-fontawesome.txt  Font Awesome Free 许可证与署名
 requirements.txt       Python 依赖
 install.sh             创建 .venv 并安装依赖
 run.sh                 使用 .venv 启动 app.py
@@ -163,7 +165,7 @@ X11 下 `OverlayWindow` 通过全局矩形定位贴图。Wayland 不允许客户
 
 默认快捷键 `ctrl+alt+d` 必须可配置。Wayland 下 KGlobalAccel 中已有的绑定优先保留（用户可在 System Settings 修改），配置文件中的 `hotkey` 在首次注册或配置变更时应用。
 
-`Controller` 负责配置热加载、快捷键重注册、选择层、后台流水线、贴图生命周期和点击外部关闭逻辑。
+`Controller` 负责配置热加载、快捷键重注册、选择层、后台流水线、贴图生命周期、系统托盘图标（`app.tray_icon` 热切换）和点击外部关闭逻辑。托盘用 `QSystemTrayIcon`（KDE 下为 StatusNotifierItem），菜单为截图、打开配置、打开日志、退出；左键单击等同触发截图。
 
 ## 安装、检查和运行
 
@@ -197,7 +199,7 @@ target = "zh-CN"
 
 1. `python -m py_compile app.py`、`bash -n install.sh run.sh`、`git diff --check`。
 2. `./run.sh --check`。
-3. 前台程序启动无异常。
+3. 前台程序启动无异常，系统托盘出现图标；`./run.sh --quit` 能结束实例。
 4. `Ctrl+Alt+D` 显示覆盖整个屏幕的选择层（X11 下任务栏只出现一次；Wayland 下整屏变暗）。
 5. 拖选区域的显示像素、全局边界和 OCR 输入一致（Wayland 注意逻辑坐标×缩放 = 物理像素）。
 6. 使用 `identity` 验证原位贴图（Wayland 贴图应出现在选区原位置）。
@@ -213,7 +215,7 @@ target = "zh-CN"
 - 不重新安装 Manggo 或覆盖 `/usr/bin/qt.conf`、`/usr/plugins` 等系统 Qt 路径。
 - 不假设系统有 Tesseract；它不是项目依赖。
 - 不把真实 API Key、`keys.toml` 或其他凭据提交到仓库。
-- 不增加主窗口、托盘图标、设置 GUI 或模态错误窗口，除非用户明确改变需求。
+- 托盘图标已按用户要求实现（`app.tray_icon`）；不增加主窗口、设置 GUI 或模态错误窗口，除非用户再次明确改变需求。
 - 不把 `.venv`、缓存、日志或个人配置提交到仓库。
 - 不使用 `git reset --hard`、`git clean -fd` 等会销毁未知修改的命令。
 - 不把 Wayland 的平台限制（点击外部关闭、Esc 焦点、多屏定位）描述成已修复；也不要在未在目标会话实测前宣称 Wayland 支持范围。

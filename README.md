@@ -1,4 +1,4 @@
-# Screenshot Translator v0.2.0
+# Screenshot Translator v0.2.1
 
 面向 **KDE Plasma + Linux** 的无主窗口截图翻译贴片器，支持 X11 与 KDE Plasma Wayland 会话。
 
@@ -128,6 +128,12 @@ KDE Wayland 会话的检查应显示 `会话: OK (wayland KDE)`、`截图后端:
 ```
 
 程序是单实例的：已经运行时再次启动只会提示“已在运行”。
+
+系统托盘会显示图标（`app.tray_icon = true`），菜单包含：
+
+- `截图并翻译`：等同按快捷键。
+- `打开配置文件` / `打开日志`。
+- `退出`：结束常驻程序。
 
 ## 配置
 
