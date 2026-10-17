@@ -6,11 +6,11 @@
 
 默认体验：
 
-`F14` → 框选区域 → Umi-OCR → 自动识别源语言 → 翻译为 `zh-CN` → 在原截图位置显示翻译贴图。
+`F14` → 框选区域 → 本地 RapidOCR（进程内）→ 自动识别源语言 → 翻译为 `zh-CN` → 在原截图位置显示翻译贴图。
 
 ## 交互
 
-- 默认快捷键：`F14`（截图翻译）；`F15`（`app.copy_hotkey`，可改可留空禁用）——只调用 Umi-OCR 识别，不翻译，识别出的原文自动复制到剪贴板并弹通知。
+- 默认快捷键：`F14`（截图翻译）；`F15`（`app.copy_hotkey`，可改可留空禁用）——只做本地 OCR 识别，不翻译，识别出的原文自动复制到剪贴板并弹通知。
 - 快捷键支持组合键和无修饰键的 `F13`–`F24`；KDE Wayland 下以配置文件为准（启动/改配置时写入 KGlobalAccel）。使用 F13–F24 前需要先启用系统键位选项，见下文“使用 F13–F24 作为快捷键”。
 - 框选完成后，选区中心显示转圈指示，OCR/翻译完成或失败后自动消失。
 - 贴图默认显示译图，原截图中的非文字区域保留。
@@ -46,7 +46,7 @@ Wayland 不允许应用读取其他窗口内容或进行全局输入监听，因
 - XDG 配置目录。
 - `./run.sh --check` 环境检查。
 - 配置热重载，快捷键修改后自动重新注册。
-- Umi-OCR 未运行时尝试自动启动并隐藏。
+- 本地 OCR 在进程内运行，随程序启动，不需要额外的 OCR 服务或端口。
 - 全局鼠标监听实现“真正点击贴图外才关闭”，不使用 `Qt.Popup`。
 - 日志级别热重载。
 - 安装失败时自动清理残缺 `.venv`。
@@ -92,7 +92,7 @@ cd ~/tools/screenshot-translator
 ./install.sh
 ```
 
-脚本只在项目目录创建 `.venv` 并向其中安装 `PySide6`、`pynput`，不会向系统 Python 安装这些包。
+脚本只在项目目录创建 `.venv` 并向其中安装 `PySide6`、`pynput`、`rapidocr`、`onnxruntime`，不会向系统 Python 安装这些包。RapidOCR 默认模型随包提供，首次识别不需要联网。
 
 若 Debian 报 `ensurepip is not available`，先安装：
 
@@ -108,7 +108,7 @@ sudo apt install python3-venv
 ./run.sh --check
 ```
 
-不会访问外部翻译服务，只检查当前会话、截图后端、全局快捷键后端、Qt 屏幕、Umi-OCR HTTP/启动脚本、系统通知等。
+不会访问外部翻译服务，只检查当前会话、截图后端、全局快捷键后端、Qt 屏幕、RapidOCR/onnxruntime 与内置模型、系统通知等。
 
 X11 会话的检查应显示 `会话: OK (x11 ...)`、`截图后端: OK (qt_x11)`、`全局快捷键(pynput): OK`。
 
@@ -156,6 +156,12 @@ input_backend = "auto"             # auto / pynput / kglobalaccel
 backend = "auto"                   # auto / qt_x11 / spectacle
 
 [ocr]
+lang = "ch"                        # ch 同时识别简体中文和常见英文
+ocr_version = "PP-OCRv6"           # PP-OCRv4 / v5 / v6
+model_type = "small"               # v6: tiny / small / medium
+use_cls = false                    # 纠正 0/180 度方向；截图通常水平
+limit_side_len = 2880              # 输入图最长边上限
+text_score = 0.5                   # 低于该置信度的文本块丢弃
 parser = "multi_para"              # multi_para / multi_line / single_para / single_line / none
 copy_parser = ""                   # 只识别模式单独指定；留空沿用 parser
 
@@ -267,21 +273,27 @@ backend = "google_cloud"
 
 程序每次截图时读取密钥文件；Key 缺失或配置格式错误会以通知和日志提示，不会把 Key 写入日志。
 
-## Umi-OCR
+## 本地 OCR
 
-默认：
+默认使用 [RapidOCR](https://github.com/RapidAI/RapidOCR) 3.x + ONNX Runtime 在程序进程内识别，不再需要 Umi-OCR 或任何 HTTP 服务。
 
-```text
-http://127.0.0.1:1224/api/ocr
+- 默认模型：PP-OCRv6 `small`（det + rec），随 wheel 自带，离线可用。
+- 默认语言：`ch`，同一模型覆盖简体中文和常见英文。
+- 排版解析：`tbpu` 移植自 Umi-OCR（MIT），用 `end` 字段恢复段落顺序；多栏、单栏、代码等 8 种方案仍通过 `ocr.parser` 选择。
+- 首次识别会加载 ONNX 模型（约 0.3–0.5 秒），之后复用同一个引擎实例；修改 `ocr` 配置会自动重建引擎。
+
+切换其他语言或模型：
+
+```toml
+[ocr]
+lang = "japan"          # en / japan / korean / chinese_cht / cyrillic 等
+ocr_version = "PP-OCRv5"
+model_type = "mobile"   # v4/v5 用 mobile / server
 ```
 
-使用 `data.format = dict`，依赖 OCR 结果中的 `text`、`box`、`end` 来恢复文本与位置。
+非内置模型组合在首次运行时会从 ModelScope 下载，需要联网。只使用默认的 `PP-OCRv6` + `small` 可保持完全离线。
 
-默认启动脚本：
-
-```text
-~/tools/Umi-OCR_Linux_Paddle_2.1.5/umi-ocr.sh
-```
+旧版配置中的 `ocr.api_url`、`ocr.umi_ocr`、`ocr.language` 会被忽略；`language` 会自动映射为对应的 `lang`。
 
 ## 当前限制
 

@@ -4,9 +4,9 @@
 
 ## 1. Handoff Metadata
 
-- Handoff 更新时间：`2026-09-14T15:20:00+08:00`
+- Handoff 更新时间：`2026-10-17T21:45:00+08:00`
 - 当前项目：Screenshot Translator
-- Handoff 范围：KDE Plasma Wayland 适配完成后的现场，以及仍然未验证的交互范围
+- Handoff 范围：OCR 从 Umi-OCR HTTP 切换为进程内 RapidOCR 后的现场，以及仍然未验证的真实截图效果
 - 项目路径：`$HOME/tools/screenshot-translator`
 - 远端：`origin`（GitHub，私钥配置在用户 `~/.ssh/config` 中，不要复制密钥）
 - 分支：`master`
@@ -19,7 +19,7 @@
 KDE Plasma Wayland 的核心链路已实现并在真实 Arch + KDE Plasma Wayland 会话中验证：
 
 ```text
-KGlobalAccel 快捷键 → Spectacle 全屏抓取 → 全屏选择层 → Umi-OCR
+KGlobalAccel 快捷键 → Spectacle 全屏抓取 → 全屏选择层 → RapidOCR（进程内）
 → 可插拔翻译 → 全屏透明画布原位贴图
 ```
 
@@ -33,7 +33,9 @@ X11 路径保留原有 `qt_x11` + `pynput` 实现。
 - `app.input_backend = auto`：X11 用 `pynput`，Wayland 用 `KGlobalAccel`（`WaylandInputService`）。
 - `OverlayWindow`/`LoadingWindow` 在 Wayland 进入全屏透明画布模式，`setMask()` 限制输入区域，其余点击穿透。
 - 贴图交互：左键按住立即拖动、滚轮以鼠标位置为锚点缩放（25%~400%）、中键归位（位置+100%）、右键点击图片关闭；合成事件单测已通过。
-- 第二个全局快捷键（默认 `F15`，`app.copy_hotkey`）：只调用 Umi-OCR 并把原文复制到剪贴板（`ocr.copy_parser` 可单独指定解析方案）；KGlobalAccel 双动作注册与 `translate=False` 流水线已单测。默认翻译快捷键为 `F14`。
+- 第二个全局快捷键（默认 `F15`，`app.copy_hotkey`）：只做本地 OCR 并把原文复制到剪贴板（`ocr.copy_parser` 可单独指定解析方案）；KGlobalAccel 双动作注册与 `translate=False` 流水线已单测。默认翻译快捷键为 `F14`。
+- OCR 改为进程内 RapidOCR 3.10.0 + onnxruntime 1.31.0（PP-OCRv6 small，随包离线）；删除 `_ensure_umi()`/HTTP 调用与 base64 传输，`get_ocr_engine()` 按配置缓存引擎。
+- 排版解析 `tbpu/` 移植自 Umi-OCR v2.1.5（MIT，保留 `LICENSE.umi`），继续提供 `end` 字段和 8 种 `ocr.parser` 方案；旧配置 `ocr.language` 自动映射为 `lang`。
 - 快捷键支持无修饰键的 F13-F24；KDE Wayland 以配置为准（启动/配置变更都写入 KGlobalAccel）。KDE 默认把 FK13-F18 映射为 XF86Tools/XF86Launch5-9，需要按 README 的 `fkeys:basic_13-24`（localectl + kxkbrc + 注销重登）启用真正的 F13-F24。
 - 单实例保护（`app.lock` + flock）和 `--quit` 停止常驻实例；系统托盘（StatusNotifierItem）提供截图、截图并复制原文、打开配置/日志、退出；已实测 SNI 注册成功。
 - `--check` 按会话输出 `截图后端` 和 `全局快捷键` 检查结果。
@@ -49,9 +51,10 @@ X11 路径保留原有 `qt_x11` + `pynput` 实现。
 
 ## 3. Verified Facts
 
-- [VERIFIED][RUNTIME] `./run.sh --check` 在 Arch + KDE Plasma Wayland 上 PASS：`会话: OK (wayland KDE)`、`截图后端: OK (spectacle)`、`全局快捷键(KGlobalAccel): OK`、`Umi-OCR HTTP: OK`。
+- [VERIFIED][RUNTIME] `./run.sh --check` 在 Arch + KDE Plasma Wayland 上 PASS：`会话: OK (wayland KDE)`、`截图后端: OK (spectacle)`、`全局快捷键(KGlobalAccel): OK`、`OCR(RapidOCR): OK`、`OCR 模型: OK`。
 - [VERIFIED][RUNTIME] KGlobalAccel `invokeShortcut` 触发后应用完成 Spectacle 抓取（2560x1440 / 逻辑 1707x960 / scale 1.4997x1.5）并显示全屏选择层；外部 Spectacle 抓屏对比显示 85.3% 采样像素被选择层暗化。
-- [VERIFIED][RUNTIME] 合成鼠标事件端到端：框选逻辑 (400,300,1001,521) → 物理裁剪 1501x782 → Umi-OCR 8 段 → `identity` → 画布贴图位置与选区一致，画布左侧区域像素完全不变。
+- [VERIFIED][RUNTIME] RapidOCR 离线合成图：900x320 中英混排 7 行全部识别，`tbpu multi_para` 按左右栏排序；`PipelineWorker` + `identity` 的源文、段落、bbox 正常，首次 0.936s（含模型加载），之后 0.369s。
+- [VERIFIED][RUNTIME] 替换前的 Umi-OCR 端到端记录（历史）：框选逻辑 (400,300,1001,521) → 物理裁剪 1501x782 → Umi-OCR 8 段 → `identity` → 画布贴图位置与选区一致，画布左侧区域像素完全不变。
 - [VERIFIED][RUNTIME] `LoadingWindow` 画布模式：全屏几何、mask 仅为选区中心 34x34 转圈、`WA_TransparentForMouseEvents`。
 - [VERIFIED][CODE] X11 路径未删除：`qt_x11`、`pynput`、定位式 `OverlayWindow` 和点击外部关闭逻辑仍在。
 - [VERIFIED][LOG] KGlobalAccel 快捷键注册成功并出现在 `~/.config/kglobalshortcutsrc` 的 `[screenshot-translator]` 段；当前默认为 `F14`/`F15`（历史快照时为 `Ctrl+Alt+D`，key `0xc000044`）。
@@ -59,6 +62,7 @@ X11 路径保留原有 `qt_x11` + `pynput` 实现。
 ## 4. Not Verified / Limitations
 
 - [UNVERIFIED] 真实鼠标交互：拖选、右键取消、过长/过短选区、贴图按钮、拖动、滚轮缩放、中键归位、右键关闭、再次截图替换尚未人工验收。
+- [UNVERIFIED] 真实截图上的 RapidOCR 识别效果（与替换前 Umi-OCR 的逐字对比、小字号/多栏/深色背景）。
 - [UNVERIFIED] 真实翻译后端（`google` / `google_cloud`）的最新一次验证；集成测试使用 `identity`。
 - [UNVERIFIED] 多屏、负坐标、混合 DPI；Wayland 选择层当前固定在 Qt 主屏幕。
 - [LIMITATION] Wayland 全局快捷键触发选择层时 KWin 不给键盘焦点（日志 `active=False`），`Esc` 可能无效；右键仍可取消。
@@ -76,7 +80,8 @@ PySide6：6.11.2（含 QtDBus）
 Spectacle：6.7.5
 屏幕：eDP-1 2560x1440 物理，缩放 1.5，逻辑 1707x960
 全局快捷键：kglobalacceld 6.7.5（KDE D-Bus）
-Umi-OCR：~/tools/Umi-OCR_Linux_Paddle_2.1.5，HTTP 127.0.0.1:1224
+Umi-OCR：~/tools/Umi-OCR_Linux_Paddle_2.1.5（仅历史参考，项目不再依赖）
+OCR：rapidocr 3.10.0 + onnxruntime 1.31.0（项目 .venv），PP-OCRv6 small
 ```
 
 用户运行目录（不在仓库内）：
@@ -99,6 +104,6 @@ Umi-OCR：~/tools/Umi-OCR_Linux_Paddle_2.1.5，HTTP 127.0.0.1:1224
 
 - 不提交真实 API Key、`keys.toml`、日志正文、OCR/翻译正文或截图像素。
 - 不读取 `keys.toml` 内容，只使用其路径和存在性。
-- 不删除 `~/tools/Umi-OCR_Linux_Paddle_2.1.5`。
+- 不删除 `~/tools/Umi-OCR_Linux_Paddle_2.1.5`（已不依赖，但保留用户文件）。
 - 不使用 `git reset --hard`、`git clean -fd` 覆盖未知修改。
 - Git 提交按 `AGENTS.md` 规范：展示文件、关键 diff 和完整消息并取得用户确认；推送前再次确认。

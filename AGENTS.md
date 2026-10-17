@@ -9,7 +9,7 @@ Screenshot Translator 是面向 Linux + KDE Plasma 的无主窗口截图翻译�
 默认流程：
 
 ```text
-F14 → 全屏选择层拖选 → Umi-OCR → 翻译 → 在原屏幕位置显示贴片
+F14 → 全屏选择层拖选 → RapidOCR（进程内）→ 翻译 → 在原屏幕位置显示贴片
 F15（app.copy_hotkey，可留空禁用）→ 同样框选 → 只 OCR
   → 原文自动复制到剪贴板 + 通知（不翻译、不显示贴图）
 ```
@@ -40,22 +40,23 @@ DISPLAY：:0
 屏幕：HDMI-0 2560x1440，devicePixelRatio=1
 ```
 
-Umi-OCR 安装位置：
+本地 OCR（项目 `.venv` 内）：
 
 ```text
-~/tools/Umi-OCR_Linux_Paddle_2.1.5
+RapidOCR 3.10.0 + onnxruntime 1.31.0
+默认模型：PP-OCRv6 small（det + rec，随 wheel 自带，离线可用）
+默认语言：ch（同时覆盖简体中文和常见英文）
 ```
 
-启动脚本：`~/tools/Umi-OCR_Linux_Paddle_2.1.5/umi-ocr.sh`。
+旧版 Umi-OCR（`~/tools/Umi-OCR_Linux_Paddle_2.1.5`）只作为历史参考，项目不再依赖它，也不再访问 `127.0.0.1:1224`。
 
-HTTP API：`http://127.0.0.1:1224/api/ocr`。
-
-项目依赖必须在项目 `.venv` 中安装。已验证 PySide6 6.11.2（含 QtDBus）、pynput 1.8.2、evdev 2.0.0、python-xlib 0.33 和 six 可用；Python 3.14 上 evdev 需要可用的 C 工具链编译，Arch 安装 `base-devel` 即可。不要把这些依赖装进系统 Python。
+项目依赖必须在项目 `.venv` 中安装。已验证 PySide6 6.11.2（含 QtDBus）、pynput 1.8.2、evdev 2.0.0、python-xlib 0.33、six、rapidocr 3.10.0、onnxruntime 1.31.0 可用；Python 3.14 上 evdev 需要可用的 C 工具链编译，Arch 安装 `base-devel` 即可。不要把这些依赖装进系统 Python。
 
 ## 文件与路径
 
 ```text
 app.py                 主程序：选择器、OCR/翻译、贴图、输入监听
+tbpu/                  排版解析（移植自 Umi-OCR v2.1.5，MIT，保留 LICENSE.umi）
 config.example.toml    默认配置模板
 keys.example.toml      Google Cloud API Key 配置模板，不含真实密钥
 assets/app-icon.svg    托盘图标源文件（Font Awesome Free 5.15.4 `globe`，CC BY 4.0；运行时按配色染白）
@@ -111,12 +112,16 @@ AGENTS.md              本文件，唯一的 Agent 说明
 
 `PipelineWorker` 在后台线程中：
 
-1. 探测 Umi-OCR HTTP 服务。
-2. 服务不可用且 `ocr.auto_start=true` 时运行 `umi-ocr.sh --hide` 并等待就绪。
-3. 以 base64 PNG 调用 `/api/ocr`，请求 `data.format = dict`；排版方案取 `ocr.parser`（`translate=False` 时可用 `ocr.copy_parser` 覆盖）。
-4. 使用返回项的 `text`、`box`、`end` 组织源文本和段落。
+1. 用 `get_ocr_engine(cfg)` 取进程内 RapidOCR 引擎；配置变化时按 `lang/ocr_version/model_type/use_cls/limit_side_len/text_score` 重建并缓存。
+2. 直接把截图的 PNG bytes 交给 RapidOCR（内部解码），得到 `boxes/txts/scores`。
+3. 转换为 `{box, text, score}` 文块，交给 `tbpu` 排版解析；方案取 `ocr.parser`（`translate=False` 时可用 `ocr.copy_parser` 覆盖）。
+4. 使用解析后的 `text`、`box`、`end` 组织源文本和段落。
 5. `translate=True` 时按段落调用可插拔翻译后端；`translate=False` 时只发出 `source_text`（`paragraphs` 为空），供复制模式使用。
 6. 发出源文、译文、段落边界框和耗时。
+
+`tbpu/` 是从 Umi-OCR v2.1.5 移植的 MIT 代码（`LICENSE.umi` 保留在目录内），只把 `line_preprocessing.py` 的 `umi_log` 换成标准库 `logging`。修改时保持输入约定：每个文块含 4 点 `box`、`text`、`score`，解析器补充 `end` 并返回阅读顺序。不要删除来源与许可证说明。
+
+OCR 默认参数：`lang=ch`、`PP-OCRv6`、`small`、`use_cls=false`、`limit_side_len=2880`、`text_score=0.5`。默认模型随 `rapidocr` wheel 自带，首次识别不联网；切换到非内置 `ocr_version`/`model_type` 时 RapidOCR 会从 ModelScope 下载模型。旧配置的 `ocr.language` 在 `load_config()` 中映射到 `lang`，其余 `api_url`/`umi_ocr` 等键忽略。
 
 支持的 backend：
 
@@ -180,7 +185,7 @@ cd ~/tools/screenshot-translator
 
 程序是单实例的：`acquire_single_instance()` 用 `~/.local/state/screenshot-translator/app.lock` 的 `flock` 阻止重复启动；没有终端窗口的实例用 `./run.sh --quit` 停止（读取锁文件 PID 后发送 SIGTERM）。锁文件不能以 `"w"` 模式打开，否则会清掉正在运行实例的 PID。
 
-`install.sh` 只在项目中创建 `.venv` 并安装 `requirements.txt`，不应使用 `sudo`，不应污染系统 Qt 路径。`--check` 不访问外部翻译服务；Umi-OCR 未运行但脚本存在时可以报告运行时自动启动警告。
+`install.sh` 只在项目中创建 `.venv` 并安装 `requirements.txt`，不应使用 `sudo`，不应污染系统 Qt 路径。`--check` 不访问外部翻译服务，也不触发模型下载；它检查 RapidOCR/onnxruntime 导入、内置 ONNX 模型数量和当前 OCR 配置。
 
 KDE Wayland 还需要系统已有 `spectacle`，以及 `gdbus`（glib2）或 `dbus-send`（dbus）之一；`install.sh` 不安装这些系统包。
 
@@ -199,8 +204,8 @@ target = "zh-CN"
 
 每次修改后依次执行：
 
-1. `python -m py_compile app.py`、`bash -n install.sh run.sh`、`git diff --check`。
-2. `./run.sh --check`。
+1. `python -m py_compile app.py tbpu/*.py tbpu/parser_tools/*.py`、`bash -n install.sh run.sh`、`git diff --check`。
+2. `./run.sh --check`，确认 `OCR(RapidOCR): OK` 与 `OCR 模型: OK`。
 3. 前台程序启动无异常，系统托盘出现图标；`./run.sh --quit` 能结束实例。
 4. `F14` 显示覆盖整个屏幕的选择层（X11 下任务栏只出现一次；Wayland 下整屏变暗）。
 5. 拖选区域的显示像素、全局边界和 OCR 输入一致（Wayland 注意逻辑坐标×缩放 = 物理像素）。
@@ -214,7 +219,8 @@ target = "zh-CN"
 
 ## 保护边界
 
-- 不删除 `~/tools/Umi-OCR_Linux_Paddle_2.1.5`。
+- 不再依赖 Umi-OCR 或任何外部 HTTP OCR 服务；不要在没有用户明确要求时重新引入 `127.0.0.1:1224` 之类的服务依赖。
+- `tbpu/` 是 MIT 移植代码，必须保留 `tbpu/LICENSE.umi` 和文件头来源说明。
 - 不重新安装 Manggo 或覆盖 `/usr/bin/qt.conf`、`/usr/plugins` 等系统 Qt 路径。
 - 不假设系统有 Tesseract；它不是项目依赖。
 - 不把真实 API Key、`keys.toml` 或其他凭据提交到仓库。
@@ -260,9 +266,10 @@ target = "zh-CN"
 
 X11 与 KDE Plasma Wayland 的适配已经完成并验证到以下程度：
 
-- `./run.sh --check` 在 Arch + KDE Plasma Wayland 上 PASS（会话、spectacle、KGlobalAccel、Qt 屏幕、Umi-OCR、通知）。
+- `./run.sh --check` 在 Arch + KDE Plasma Wayland 上 PASS（会话、spectacle、KGlobalAccel、Qt 屏幕、RapidOCR、通知）。
 - KGlobalAccel 触发 → Spectacle 全屏抓取 → 全屏选择层（外部截图确认 85% 像素被暗化）已验证。
-- 合成鼠标事件端到端：框选逻辑坐标 (400,300,1001,521) → 物理裁剪 1501x782 → Umi-OCR 8 段 → `identity` 渲染 → Wayland 画布贴图位置与选区一致，画布外区域像素不变。
+- RapidOCR 离线合成图验证：900x320 中英混排 7 行全部识别，`tbpu multi_para` 把左右两栏按列排序；`PipelineWorker` 在 `identity` 后端下源文、段落与 bbox 正常，首次约 0.9s（含模型加载），之后约 0.37s。
+- 替换前的 Umi-OCR 端到端记录（历史）：框选逻辑坐标 (400,300,1001,521) → 物理裁剪 1501x782 → Umi-OCR 8 段 → `identity` 渲染 → Wayland 画布贴图位置与选区一致，画布外区域像素不变。
 - 尚未在真实鼠标/拖动/按钮操作下完成人工交互验收；`Esc` 焦点、点击外部关闭、多屏、混合缩放的 Wayland 行为仍未验证。
 
 后续优先事项：
