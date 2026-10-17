@@ -4,9 +4,9 @@
 KDE Plasma / Linux screenshot translation overlay (X11 and Wayland).
 
 Default flow:
-    F14 -> region selection -> Umi-OCR HTTP API
+    F14 -> region selection -> RapidOCR (in process)
     -> pluggable translation backend -> translated image over original region.
-    F15 -> region selection -> Umi-OCR only -> source text copied to clipboard.
+    F15 -> region selection -> RapidOCR only -> source text copied to clipboard.
 
 X11 keeps the direct Qt/X11 grab and pynput global hotkey. KDE Plasma Wayland
 uses Spectacle fullscreen capture plus the KGlobalAccel D-Bus shortcut service.
@@ -17,7 +17,6 @@ No main window and no tray icon. Failures use desktop notifications + log only.
 from __future__ import annotations
 
 import argparse
-import base64
 import fcntl
 import json
 import logging
@@ -28,6 +27,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, NamedTuple
 import urllib.error
@@ -35,6 +35,8 @@ import urllib.parse
 import urllib.request
 
 import tomllib
+
+from tbpu import getParser
 
 PYNPUT_IMPORT_ERROR: Exception | None = None
 try:
@@ -153,16 +155,20 @@ DEFAULTS: dict[str, Any] = {
         "min_height": 8,
     },
     "ocr": {
-        "api_url": "http://127.0.0.1:1224/api/ocr",
-        "auto_start": True,
-        "umi_ocr": "~/tools/Umi-OCR_Linux_Paddle_2.1.5/umi-ocr.sh",
-        "startup_timeout_s": 8.0,
-        "request_timeout_s": 20.0,
-        "language": "models/config_chinese.txt",
+        # RapidOCR 在本进程内识别，不再依赖外部 Umi-OCR 服务。
+        # lang=ch 使用的 PP-OCR 中文模型同时覆盖常见英文。
+        "lang": "ch",
+        "ocr_version": "PP-OCRv6",
+        "model_type": "small",
+        # 仅纠正 0/180 度方向；截图通常水平，默认关闭以省时。
+        "use_cls": False,
+        # 输入图最长边上限；超出时先等比缩小。
+        "limit_side_len": 2880,
+        # 低于该置信度的文本块直接丢弃。
+        "text_score": 0.5,
         "parser": "multi_para",
         # 只识别不翻译时单独使用的排版解析方案；留空则沿用 parser。
         "copy_parser": "",
-        "limit_side_len": 2880,
     },
     "translation": {
         "backend": "google",
@@ -197,6 +203,16 @@ DEFAULTS: dict[str, Any] = {
 }
 
 
+LEGACY_OCR_LANGS = {
+    "config_chinese.txt": "ch",
+    "config_en.txt": "en",
+    "config_chinese_cht.txt": "chinese_cht",
+    "config_japan.txt": "japan",
+    "config_korean.txt": "korean",
+    "config_cyrillic.txt": "cyrillic",
+}
+
+
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, value in base.items():
@@ -228,6 +244,13 @@ def load_config() -> dict[str, Any]:
     ensure_config()
     with CONFIG_PATH.open("rb") as f:
         user_cfg = tomllib.load(f)
+    # 旧版 Umi-OCR 配置用 ocr.language 指向模型文件；迁移到 RapidOCR 的 lang。
+    ocr_cfg = user_cfg.get("ocr")
+    if isinstance(ocr_cfg, dict) and "lang" not in ocr_cfg:
+        legacy_model = Path(str(ocr_cfg.get("language", ""))).name
+        legacy_lang = LEGACY_OCR_LANGS.get(legacy_model)
+        if legacy_lang:
+            ocr_cfg["lang"] = legacy_lang
     return deep_merge(DEFAULTS, user_cfg)
 
 
@@ -815,6 +838,76 @@ class LoadingWindow(QWidget):
         super().closeEvent(event)
 
 
+_OCR_ENGINE: Any = None
+_OCR_ENGINE_KEY: tuple[Any, ...] | None = None
+_OCR_ENGINE_LOCK = threading.Lock()
+
+
+def _ocr_engine_key(cfg: dict[str, Any]) -> tuple[Any, ...]:
+    ocr_cfg = cfg["ocr"]
+    return (
+        str(ocr_cfg.get("lang", "ch")),
+        str(ocr_cfg.get("ocr_version", "PP-OCRv6")),
+        str(ocr_cfg.get("model_type", "small")),
+        bool(ocr_cfg.get("use_cls", False)),
+        int(ocr_cfg.get("limit_side_len", 2880)),
+        float(ocr_cfg.get("text_score", 0.5)),
+    )
+
+
+def get_ocr_engine(cfg: dict[str, Any]) -> Any:
+    """Load one RapidOCR engine per OCR config and reuse it across captures."""
+    global _OCR_ENGINE, _OCR_ENGINE_KEY
+    key = _ocr_engine_key(cfg)
+    with _OCR_ENGINE_LOCK:
+        if _OCR_ENGINE is not None and _OCR_ENGINE_KEY == key:
+            return _OCR_ENGINE
+        try:
+            from rapidocr import ModelType, OCRVersion, RapidOCR
+        except Exception as exc:
+            raise RuntimeError(f"RapidOCR 未安装或导入失败: {exc}") from exc
+
+        ocr_cfg = cfg["ocr"]
+        try:
+            ocr_version = OCRVersion(str(ocr_cfg.get("ocr_version", "PP-OCRv6")))
+        except ValueError:
+            ocr_version = OCRVersion.PPOCRV6
+        try:
+            model_type = ModelType(str(ocr_cfg.get("model_type", "small")))
+        except ValueError:
+            model_type = ModelType.SMALL
+
+        limit = max(320, int(ocr_cfg.get("limit_side_len", 2880)))
+        params = {
+            "Global.use_cls": bool(ocr_cfg.get("use_cls", False)),
+            "Global.max_side_len": limit,
+            "Global.min_side_len": 30,
+            "Global.text_score": float(ocr_cfg.get("text_score", 0.5)),
+            "Global.log_level": "warning",
+            "Det.model_type": model_type,
+            "Det.ocr_version": ocr_version,
+            "Det.limit_side_len": limit,
+            "Det.limit_type": "max",
+            "Rec.model_type": model_type,
+            "Rec.ocr_version": ocr_version,
+            "Rec.lang_type": str(ocr_cfg.get("lang", "ch")),
+        }
+        LOG.info(
+            "loading RapidOCR lang=%s version=%s model=%s limit=%d",
+            params["Rec.lang_type"],
+            ocr_version.value,
+            model_type.value,
+            limit,
+        )
+        try:
+            engine = RapidOCR(params=params)
+        except Exception as exc:
+            raise RuntimeError(f"RapidOCR 初始化失败: {exc}") from exc
+        _OCR_ENGINE = engine
+        _OCR_ENGINE_KEY = key
+        return engine
+
+
 class PipelineWorker(QThread):
     done = Signal(object)
     failed = Signal(str)
@@ -837,7 +930,6 @@ class PipelineWorker(QThread):
     def run(self) -> None:
         try:
             started = time.monotonic()
-            self._ensure_umi()
             blocks = self._ocr()
             source_text = "".join(
                 str(item.get("text", "")) + str(item.get("end", "")) for item in blocks
@@ -906,97 +998,30 @@ class PipelineWorker(QThread):
         except Exception as exc:
             raise RuntimeError("服务返回了无法解析的 JSON") from exc
 
-    def _options_url(self) -> str:
-        api_url = str(self.cfg["ocr"]["api_url"]).rstrip("/")
-        if api_url.endswith("/api/ocr"):
-            return api_url + "/get_options"
-        return api_url.rsplit("/", 1)[0] + "/get_options"
-
-    def _umi_ready(self) -> bool:
-        try:
-            self._http_json(self._options_url(), timeout=0.8)
-            return True
-        except Exception:
-            return False
-
-    def _ensure_umi(self) -> None:
-        ocr_cfg = self.cfg["ocr"]
-        if self._umi_ready():
-            return
-        if not bool(ocr_cfg.get("auto_start", True)):
-            raise RuntimeError("Umi-OCR HTTP 服务未运行")
-
-        script = Path(os.path.expanduser(str(ocr_cfg["umi_ocr"]))).resolve()
-        if not script.exists():
-            raise RuntimeError(f"找不到 Umi-OCR 启动脚本: {script}")
-
-        LOG.info("starting Umi-OCR script=%s", script)
-        subprocess.Popen(
-            [str(script), "--hide"],
-            cwd=str(script.parent),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-
-        deadline = time.monotonic() + float(ocr_cfg.get("startup_timeout_s", 8.0))
-        while time.monotonic() < deadline:
-            if self._umi_ready():
-                # Umi-OCR Linux cold start can miss the first control command.
-                try:
-                    subprocess.Popen(
-                        [str(script), "--hide"],
-                        cwd=str(script.parent),
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                except Exception:
-                    pass
-                return
-            time.sleep(0.25)
-        raise RuntimeError("Umi-OCR 启动超时；请确认 HTTP 服务已启用")
-
     def _ocr(self) -> list[dict[str, Any]]:
         ocr_cfg = self.cfg["ocr"]
+        engine = get_ocr_engine(self.cfg)
+        try:
+            result = engine(self.png)
+        except Exception as exc:
+            raise RuntimeError(f"OCR 失败: {exc}") from exc
+
+        if result is None or result.boxes is None or not result.txts:
+            raise RuntimeError("没有识别到文字")
+
+        scores = result.scores or [0.0] * len(result.txts)
+        blocks: list[dict[str, Any]] = []
+        for box, text, score in zip(result.boxes, result.txts, scores):
+            text = str(text).strip()
+            if not text:
+                continue
+            points = [[int(round(float(x))), int(round(float(y)))] for x, y in box]
+            blocks.append({"box": points, "text": text, "score": float(score)})
+        if not blocks:
+            raise RuntimeError("没有识别到文字")
+
         parser = self.parser_override or str(ocr_cfg["parser"])
-        payload = {
-            "base64": base64.b64encode(self.png).decode("ascii"),
-            "options": {
-                "ocr.language": str(ocr_cfg["language"]),
-                "ocr.limit_side_len": int(ocr_cfg["limit_side_len"]),
-                "tbpu.parser": parser,
-                "data.format": "dict",
-            },
-        }
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        url = str(ocr_cfg["api_url"])
-        last_error: Exception | None = None
-        for attempt in range(2):
-            try:
-                res = self._http_json(
-                    url,
-                    method="POST",
-                    body=body,
-                    headers={"Content-Type": "application/json"},
-                    timeout=float(ocr_cfg.get("request_timeout_s", 20.0)),
-                )
-                if not isinstance(res, dict):
-                    raise RuntimeError("Umi-OCR 返回格式异常")
-                code = int(res.get("code", -1))
-                if code == 101:
-                    raise RuntimeError("没有识别到文字")
-                if code != 100:
-                    raise RuntimeError(f"Umi-OCR 失败(code={code})")
-                data = res.get("data")
-                if not isinstance(data, list):
-                    raise RuntimeError("Umi-OCR 返回格式异常")
-                return data
-            except Exception as exc:
-                last_error = exc
-                if attempt == 0:
-                    time.sleep(0.3)
-        assert last_error is not None
-        raise last_error
+        return getParser(parser).run(blocks)
 
     @staticmethod
     def _bbox_for_group(group: list[dict[str, Any]]) -> list[int] | None:
@@ -1013,7 +1038,7 @@ class PipelineWorker(QThread):
         return [min(xs), min(ys), max(xs), max(ys)]
 
     def _make_paragraphs(self, blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Use Umi-OCR's end field, with a small safety cap for malformed output."""
+        """Use the tbpu paragraph end field, with a small safety cap for malformed output."""
         groups: list[list[dict[str, Any]]] = []
         current: list[dict[str, Any]] = []
         for item in blocks:
@@ -2232,19 +2257,6 @@ class Controller(QObject):
             overlay.close()
 
 
-def standalone_http_json(url: str, timeout: float = 0.8) -> Any:
-    req = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def ocr_options_url(cfg: dict[str, Any]) -> str:
-    api_url = str(cfg["ocr"]["api_url"]).rstrip("/")
-    if api_url.endswith("/api/ocr"):
-        return api_url + "/get_options"
-    return api_url.rsplit("/", 1)[0] + "/get_options"
-
-
 def kglobalaccel_available() -> bool:
     if QDBusConnection is None or QDBusMessage is None:
         return False
@@ -2351,21 +2363,30 @@ def run_check(app: QApplication, cfg: dict[str, Any]) -> int:
         print("Qt 屏幕: FAIL")
         critical += 1
 
-    umi_script = Path(os.path.expanduser(str(cfg["ocr"]["umi_ocr"]))).resolve()
-    if umi_script.exists():
-        print(f"Umi-OCR 启动脚本: OK ({umi_script})")
-    else:
-        print(f"Umi-OCR 启动脚本: WARN (未找到 {umi_script})")
-
+    ocr_cfg = cfg["ocr"]
     try:
-        standalone_http_json(ocr_options_url(cfg), timeout=0.8)
-        print("Umi-OCR HTTP: OK")
-    except Exception as exc:
-        if bool(cfg["ocr"].get("auto_start", True)) and umi_script.exists():
-            print(f"Umi-OCR HTTP: WARN (当前未响应；运行时会自动启动: {exc})")
+        import importlib.metadata
+
+        import onnxruntime
+        import rapidocr
+
+        rapid_version = importlib.metadata.version("rapidocr")
+        model_dir = Path(rapidocr.__file__).resolve().parent / "models"
+        model_count = len(list(model_dir.glob("*.onnx")))
+        print(f"OCR(RapidOCR): OK (v{rapid_version}, onnxruntime {onnxruntime.__version__})")
+        print(
+            "OCR 配置: "
+            f"lang={ocr_cfg.get('lang')} version={ocr_cfg.get('ocr_version')} "
+            f"model={ocr_cfg.get('model_type')} limit={ocr_cfg.get('limit_side_len')} "
+            f"parser={ocr_cfg.get('parser')}"
+        )
+        if model_count:
+            print(f"OCR 模型: OK ({model_count} 个内置 ONNX 模型)")
         else:
-            print(f"Umi-OCR HTTP: FAIL ({exc})")
-            critical += 1
+            print(f"OCR 模型: WARN (未找到内置模型: {model_dir})")
+    except Exception as exc:
+        print(f"OCR(RapidOCR): FAIL ({exc})")
+        critical += 1
 
     if shutil.which("notify-send"):
         print(f"系统通知: OK ({shutil.which('notify-send')})")

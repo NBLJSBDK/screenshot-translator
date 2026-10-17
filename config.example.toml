@@ -40,23 +40,27 @@ min_width = 8
 min_height = 8
 
 [ocr]
-# Umi-OCR 官方 HTTP API，默认端口 1224。
-api_url = "http://127.0.0.1:1224/api/ocr"
-# Umi-OCR 未运行时自动尝试启动并隐藏。
-auto_start = true
-umi_ocr = "~/tools/Umi-OCR_Linux_Paddle_2.1.5/umi-ocr.sh"
-startup_timeout_s = 8.0
-request_timeout_s = 20.0
-# 中文模型同时能识别常见英文，适合默认自动识别源语言。
-language = "models/config_chinese.txt"
-# 排版解析方案（Umi-OCR tbpu.parser）：
+# 本地进程内 OCR（RapidOCR + ONNX Runtime），不再需要外部 Umi-OCR 服务。
+# 语言：ch 的 PP-OCR 模型同时覆盖简体中文和常见英文；
+# 可选 en / japan / korean / chinese_cht / cyrillic 等。
+lang = "ch"
+# 模型版本与规模。PP-OCRv6 支持 tiny / small / medium；默认 small 随包自带、离线可用。
+# 改用 v4/v5 或 server/mobile 时，首次运行可能需要联网下载模型。
+ocr_version = "PP-OCRv6"
+model_type = "small"
+# 仅纠正 0/180 度方向；截图通常水平，关闭可省时间。
+use_cls = false
+# 输入图最长边上限，超出时等比缩小；越大越慢、越准。
+limit_side_len = 2880
+# 低于该置信度的文本块丢弃。
+text_score = 0.5
+# 排版解析方案（tbpu，移植自 Umi-OCR）：
 # multi_para(多栏-自然段) / multi_line(多栏-总是换行) / multi_none(多栏-无换行)
 # single_para(单栏-自然段) / single_line(单栏-总是换行) / single_none(单栏-无换行)
 # single_code(单栏-保留缩进) / none(不做处理)
 parser = "multi_para"
 # 只识别不翻译时单独使用的解析方案；留空则沿用 parser。
 copy_parser = ""
-limit_side_len = 2880
 
 [translation]
 # 支持：google（免 Key 网页接口）/ google_cloud（官方 Basic v2）/
